@@ -1,53 +1,39 @@
-const questions = [
-  "오늘 딱 하나 바꿀 수 있다면 무엇일까요?",
-  "요즘 자꾸 마음이 가는 것은 무엇인가요?",
-  "완벽하지 않아도 시작해 볼 수 있는 일은?",
-  "오늘의 나에게 가장 필요한 한마디는 무엇일까요?",
-  "이번 주에 새롭게 배워 보고 싶은 것은?",
-  "누군가에게 고맙다고 말한다면 누구인가요?",
-  "최근 나를 웃게 만든 사소한 일은 무엇인가요?",
-  "지금 잠시 내려놓아도 괜찮은 걱정은 무엇일까요?",
-  "어릴 때 좋아했던 것 중 다시 해 보고 싶은 것은?",
-  "내일의 나를 위해 오늘 해 둘 수 있는 작은 일은?",
-  "요즘 나에게 영감을 주는 사람은 누구인가요?",
-  "시간이 두 배로 생긴다면 가장 먼저 무엇을 할까요?",
-  "지금 있는 곳에서 가장 마음에 드는 것은 무엇인가요?",
-  "최근에 새롭게 알게 된 나의 모습은 무엇인가요?",
-  "한 달 동안 매일 해 보고 싶은 작은 습관은?",
-  "오늘 누구에게 안부를 묻고 싶나요?",
-  "실패할 걱정이 없다면 무엇에 도전하고 싶나요?",
-  "나만의 속도로 잘하고 있는 일은 무엇인가요?",
-  "이번 계절이 가기 전에 꼭 하고 싶은 것은?",
-  "최근에 가장 잘한 선택은 무엇이었나요?",
-  "지금의 기분을 색으로 표현하면 무슨 색인가요?",
-  "오래 기억하고 싶은 오늘의 장면은 무엇인가요?",
-  "나를 편안하게 만드는 장소는 어디인가요?",
-  "누군가에게 꼭 추천하고 싶은 것은 무엇인가요?",
-  "지금보다 조금 더 단순해져도 되는 것은?",
-  "하루 동안 다른 사람이 될 수 있다면 누구이고 싶나요?",
-  "요즘 가장 궁금한 것은 무엇인가요?",
-  "오늘 스스로에게 칭찬해 주고 싶은 점은?",
-  "지금 당장 10분 동안 즐길 수 있는 일은 무엇인가요?",
-  "다음 여행에서 가장 만나고 싶은 풍경은 무엇인가요?",
-  "1년 뒤의 나에게 어떤 질문을 남기고 싶나요?",
-  "아무 이유 없이 좋아하는 것은 무엇인가요?",
-  "최근 마음을 움직인 문장이나 말은 무엇인가요?",
-  "오늘 하루에 제목을 붙인다면 무엇일까요?",
-  "지금 시작하면 미래의 내가 고마워할 일은?",
-  "나만 알고 있기 아까운 작은 행복은 무엇인가요?",
-];
+const menuButton = document.querySelector(".menu-button");
+const navigation = document.querySelector(".navigation");
+const navLinks = document.querySelectorAll(".navigation a");
+const revealElements = document.querySelectorAll(".reveal");
 
-const idea = document.querySelector("#idea");
-const ideaButton = document.querySelector("#ideaButton");
-const year = document.querySelector("#year");
-let currentQuestion = 0;
+document.querySelector("#year").textContent = new Date().getFullYear();
 
-year.textContent = new Date().getFullYear();
-
-ideaButton.addEventListener("click", () => {
-  currentQuestion = (currentQuestion + 1) % questions.length;
-  idea.textContent = questions[currentQuestion];
-  idea.classList.remove("is-changing");
-  void idea.offsetWidth;
-  idea.classList.add("is-changing");
+menuButton.addEventListener("click", () => {
+  const isOpen = menuButton.getAttribute("aria-expanded") === "true";
+  menuButton.setAttribute("aria-expanded", String(!isOpen));
+  menuButton.textContent = isOpen ? "MENU" : "CLOSE";
+  navigation.classList.toggle("is-open", !isOpen);
 });
+
+navLinks.forEach((link) => {
+  link.addEventListener("click", () => {
+    menuButton.setAttribute("aria-expanded", "false");
+    menuButton.textContent = "MENU";
+    navigation.classList.remove("is-open");
+  });
+});
+
+if ("IntersectionObserver" in window) {
+  const observer = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add("is-visible");
+          observer.unobserve(entry.target);
+        }
+      });
+    },
+    { threshold: 0.12 },
+  );
+
+  revealElements.forEach((element) => observer.observe(element));
+} else {
+  revealElements.forEach((element) => element.classList.add("is-visible"));
+}
