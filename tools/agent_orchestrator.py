@@ -34,6 +34,7 @@ SENSITIVE_CHANGE_PATTERNS = (
     re.compile(r"\b(production config|production setting|major (?:package|dependency) upgrade)\b", re.I),
 )
 PLANNER_DECISIONS = {"PROCEED", "NO_CHANGES", "STOP_REQUIRED"}
+PROTECTED_BRANCHES = {"main", "master"}
 
 
 class OrchestratorError(RuntimeError):
@@ -154,6 +155,8 @@ def assert_prime_command_allowed(args: Sequence[str], approved_worktree: Path) -
         index += 2
 
     expected_worktree = approved_worktree.resolve()
+    if expected_worktree == ROOT.resolve() or ROOT.resolve() in expected_worktree.parents:
+        raise OrchestratorError("Prime Agent --cwd는 저장소 외부의 feature worktree여야 합니다.")
     if resolved_path(values.get("--cwd", "")) != expected_worktree:
         raise OrchestratorError("Prime Agent --cwd가 승인된 feature worktree와 다릅니다.")
     session = resolved_path(values.get("--session-dir", ""))
@@ -221,6 +224,22 @@ def git_status(cwd: Path = ROOT) -> str:
     return run_cmd(["git", "status", "--porcelain"], cwd=cwd).stdout
 
 
+def git_tracked_status(cwd: Path = ROOT) -> str:
+    """Return tracked changes only; user-owned untracked files are out of scope."""
+    return run_cmd(["git", "status", "--porcelain", "--untracked-files=no"], cwd=cwd).stdout
+
+
+def assert_feature_worktree(cwd: Path) -> None:
+    """Require write-capable stages to use an external, non-protected worktree."""
+    resolved = cwd.resolve()
+    if resolved == ROOT.resolve():
+        raise OrchestratorError("main/master 기준 작업공간에서는 직접 파일 수정 단계를 실행할 수 없습니다.")
+    if ROOT.resolve() in resolved.parents:
+        raise OrchestratorError("구현 worktree는 저장소 외부에 있어야 합니다.")
+    if git_branch(resolved) in PROTECTED_BRANCHES:
+        raise OrchestratorError("main/master 보호 브랜치에서는 파일 수정 단계를 실행할 수 없습니다.")
+
+
 def load_config() -> dict[str, Any]:
     config = load_json(CONFIG_FILE)
     root = Path(config["worktree_root"])
@@ -251,7 +270,13 @@ def doctor_rows() -> tuple[list[tuple[str, bool, str]], bool]:
         sdk_ok, sdk_detail = False, f"{VENV_PYTHON} 환경에서 설치 필요"
     rows.append(("Codex SDK", sdk_ok, sdk_detail))
     branch = git_branch() if binary("git") else "unknown"
-    rows.append(("보호 브랜치가 아님", branch not in {"main", "master"}, f"현재: {branch}"))
+    if branch == "main":
+        branch_detail = "main은 읽기 전용 기준 브랜치"
+    elif branch == "master":
+        branch_detail = "master는 읽기 전용 기준 브랜치"
+    else:
+        branch_detail = f"feature 브랜치: {branch}"
+    rows.append(("보호 브랜치 정책", True, branch_detail))
     gh_ok = False
     if binary("gh"):
         result = run_cmd(["gh", "auth", "status"], check=False)
@@ -267,7 +292,8 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     rows, all_ok = doctor_rows()
     for name, ok, detail in rows:
         print(f"[{'OK' if ok else 'FAIL'}] {name}: {detail}")
-    if not all_ok:
+    gh_ok = next(ok for name, ok, _detail in rows if name == "GitHub 인증")
+    if not gh_ok:
         print("GitHub 인증 실패는 --issue 실행을 막지만 --text --dry-run에는 영향을 주지 않습니다.")
     return 0 if all_ok else 1
 
@@ -437,8 +463,10 @@ def redact_secrets(text: str, env: dict[str, str] | None = None) -> str:
 def run_prime(state: dict[str, Any], correction: str | None = None) -> None:
     config = load_config()
     worktree = Path(state["worktree"])
-    if git_branch(worktree) in {"main", "master"}:
-        fail(state, "Prime Agent를 보호 브랜치에서 실행하려 했습니다.", "worktree/branch 상태를 확인하세요.")
+    try:
+        assert_feature_worktree(worktree)
+    except OrchestratorError as exc:
+        fail(state, str(exc), "저장소 외부의 전용 feature branch/worktree를 생성한 뒤 다시 실행하세요.")
     session_dir = RUNTIME_DIR / "prime-sessions" / state["run_id"]
     session_dir.mkdir(parents=True, exist_ok=True)
     base = (AGENT_DIR / "prompts" / "implementer.md").read_text(encoding="utf-8")
@@ -608,6 +636,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise OrchestratorError("작업 내용이 비어 있습니다.")
     state = new_state(task, source, args.dry_run)
     save_state(state, "initialized", "새 실행 상태 저장")
+    branch = git_branch()
+    if branch in PROTECTED_BRANCHES and git_tracked_status(ROOT).strip():
+        fail(
+            state, f"{branch} 기준 작업공간에 추적된 수정사항이 남아 있습니다.",
+            "수정사항을 직접 검토해 보존하거나 정리한 뒤 다시 실행하세요. 미추적 파일은 건드리지 않습니다.",
+        )
     rows, _ = doctor_rows()
     blockers = [
         name for name, ok, _detail in rows
