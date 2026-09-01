@@ -1,0 +1,9 @@
+# Complete clean virtual environment lock generated with `pip freeze --all`.
+annotated-types==0.8.0
+openai-codex==0.147.0
+openai-codex-cli-bin==0.147.0
+pip==23.2.1
+pydantic==2.13.5
+pydantic_core==2.46.5
+typing-inspection==0.4.4
+typing_extensions==4.16.0

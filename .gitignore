@@ -1,0 +1,8 @@
+# Agent orchestrator local-only data
+.agent/venv/
+.agent/runtime/
+
+# Generated deployment and Python cache files
+dist/
+__pycache__/
+*.pyc
