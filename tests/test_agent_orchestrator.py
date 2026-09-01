@@ -1,5 +1,7 @@
 import argparse
+import contextlib
 import importlib.util
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -158,6 +160,84 @@ class CommandSafetyTests(unittest.TestCase):
                 self.prime_command("implement", session=Path("/tmp/prime-session")),
                 approved_worktree=self.worktree,
             )
+
+    def test_main_workspace_as_prime_cwd_is_blocked(self):
+        with (
+            mock.patch.object(orchestrator, "load_config", return_value=self.config),
+            mock.patch.object(orchestrator, "resolved_path", side_effect=lambda value: Path(value).resolve()),
+            self.assertRaises(orchestrator.OrchestratorError),
+        ):
+            orchestrator.assert_command_allowed(
+                self.prime_command("implement", cwd=orchestrator.ROOT),
+                approved_worktree=orchestrator.ROOT,
+            )
+
+
+class BranchPolicyTests(unittest.TestCase):
+    def doctor_rows_for(self, branch, gh_returncode=0):
+        completed = mock.Mock(returncode=gh_returncode)
+        with (
+            mock.patch.object(orchestrator, "binary", side_effect=lambda name: f"/usr/bin/{name}"),
+            mock.patch.object(orchestrator, "git_branch", return_value=branch),
+            mock.patch.object(orchestrator, "run_cmd", return_value=completed),
+            mock.patch.dict("sys.modules", {"openai_codex": mock.Mock()}),
+        ):
+            return orchestrator.doctor_rows()
+
+    def test_main_doctor_passes_protected_branch_policy(self):
+        rows, _ = self.doctor_rows_for("main")
+        self.assertIn(("보호 브랜치 정책", True, "main은 읽기 전용 기준 브랜치"), rows)
+
+    def test_master_doctor_passes_protected_branch_policy(self):
+        rows, _ = self.doctor_rows_for("master")
+        self.assertIn(("보호 브랜치 정책", True, "master는 읽기 전용 기준 브랜치"), rows)
+
+    def test_feature_branch_doctor_passes_and_names_branch(self):
+        rows, _ = self.doctor_rows_for("feature/safe")
+        self.assertIn(("보호 브랜치 정책", True, "feature 브랜치: feature/safe"), rows)
+
+    def test_planner_on_main_is_read_only(self):
+        codex = mock.MagicMock()
+        codex.thread_start.return_value.run.return_value.final_response = "plan"
+        codex.thread_start.return_value.id = "thread"
+        codex_context = mock.MagicMock()
+        codex_context.__enter__.return_value = codex
+        sandbox = mock.Mock(read_only="READ_ONLY")
+        module = mock.Mock(Codex=mock.Mock(return_value=codex_context), Sandbox=sandbox)
+        with (
+            mock.patch.dict("sys.modules", {"openai_codex": module}),
+            mock.patch.object(orchestrator, "load_config", return_value={"planner": {"model": "model", "reasoning_effort": "medium"}}),
+        ):
+            orchestrator.codex_turn("planner", "inspect", orchestrator.ROOT)
+        self.assertEqual(codex.thread_start.call_args.kwargs["sandbox"], "READ_ONLY")
+        self.assertEqual(codex.thread_start.return_value.run.call_args.kwargs["sandbox"], "READ_ONLY")
+
+    def test_direct_file_modification_stage_on_main_is_blocked(self):
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.assert_feature_worktree(orchestrator.ROOT)
+
+    def test_prime_allowed_after_external_feature_worktree_creation(self):
+        worktree = Path("/workspaces/agent-orchestrator-worktrees/test-feature")
+        with mock.patch.object(orchestrator, "git_branch", return_value="feature/test"):
+            orchestrator.assert_feature_worktree(worktree)
+
+    def test_github_auth_success_has_no_failure_guidance(self):
+        rows, all_ok = self.doctor_rows_for("main", 0)
+        with (
+            mock.patch.object(orchestrator, "doctor_rows", return_value=(rows, all_ok)),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            orchestrator.cmd_doctor(argparse.Namespace())
+        self.assertNotIn("GitHub 인증 실패는", output.getvalue())
+
+    def test_github_auth_failure_prints_issue_guidance(self):
+        rows, all_ok = self.doctor_rows_for("main", 1)
+        with (
+            mock.patch.object(orchestrator, "doctor_rows", return_value=(rows, all_ok)),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            orchestrator.cmd_doctor(argparse.Namespace())
+        self.assertIn("GitHub 인증 실패는 --issue 실행을 막지만", output.getvalue())
 
 
 if __name__ == "__main__":
