@@ -44,6 +44,14 @@ process and may invoke tools available to its account. The orchestrator reduces 
 worktree, credential stripping, explicit prompts, command allow/deny checks, Git state checks, and approval
 gates. Run it only in a trusted local environment and review its output before approving external actions.
 
+## Post-approval automation verification
+
+After the second approval, confirm that:
+
+- `pushed: true` is recorded only after the feature branch push succeeds.
+- The created Draft PR has `main` as its base and the orchestrator-created `agent/issue-<number>` branch as its head.
+- The workflow does not automatically mark the PR Ready, merge it, or deploy it.
+
 ## Checks
 
 The orchestrator discovers scripts that actually exist in `package.json`. Missing lint, typecheck, test, or
