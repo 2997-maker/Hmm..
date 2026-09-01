@@ -32,6 +32,8 @@ The launcher automatically re-executes itself with the dedicated interpreter whe
 - GitHub and Cloudflare credential variables are removed from the Prime Agent child-process environment.
 - A first terminal approval is required before creating a branch/worktree or running Prime Agent.
 - A second terminal approval is required before pushing the feature branch and creating a Draft PR.
+- After that approval, the orchestrator alone may run exactly `git push --set-upstream origin <state branch>` for its owned feature worktree. It never permits force, delete, tag, alternate remote, or arbitrary refspec pushes.
+- It creates only `gh pr create --draft --base main --head <state branch> --fill`. On resume it skips completed commits and pushes, and reuses only one existing PR whose base, head, and Draft status exactly match; Ready or inconsistent PRs stop the run.
 - `main` and `master` are never direct modification or push targets. Merge and deployment are never automated.
 - Database, authentication, production configuration, or major dependency changes stop the workflow.
 - Prime Agent can receive at most one correction request after independent review.

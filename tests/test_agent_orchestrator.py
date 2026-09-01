@@ -131,6 +131,11 @@ class CommandSafetyTests(unittest.TestCase):
         with self.assertRaises(orchestrator.OrchestratorError):
             orchestrator.assert_command_allowed(["gh", "pr", "create"])
 
+    def test_gh_pr_merge_and_ready_are_blocked(self):
+        for command in (["gh", "pr", "merge", "5"], ["gh", "pr", "ready", "5"]):
+            with self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator.assert_command_allowed(command)
+
     def test_bash_c_git_push_is_blocked(self):
         with self.assertRaises(orchestrator.OrchestratorError):
             orchestrator.assert_command_allowed(["bash", "-c", "git push origin main"])
@@ -238,6 +243,200 @@ class BranchPolicyTests(unittest.TestCase):
         ):
             orchestrator.cmd_doctor(argparse.Namespace())
         self.assertIn("GitHub 인증 실패는 --issue 실행을 막지만", output.getvalue())
+
+
+class ExternalApprovalTests(unittest.TestCase):
+    def external_state(self):
+        state = orchestrator.new_state("test", "text", False)
+        state.update({
+            "branch": "agent/issue-5", "worktree": "/tmp/agent-test-worktree",
+            "worktree_owned": True, "pushed": False, "commit": "abc123",
+            "completed_steps": ["external_approval"],
+        })
+        return state
+
+    def test_push_requires_external_approval(self):
+        state = self.external_state()
+        state["completed_steps"] = []
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.approved_feature_push(state, Path(state["worktree"]))
+
+    def test_exact_approved_push_is_the_only_push_command(self):
+        state = self.external_state()
+        completed = mock.Mock()
+        with (
+            mock.patch.object(orchestrator, "assert_approved_external_state", return_value=state["branch"]),
+            mock.patch.object(orchestrator.subprocess, "run", return_value=completed) as execute,
+        ):
+            orchestrator.approved_feature_push(state, Path(state["worktree"]))
+        execute.assert_called_once_with(
+            ["git", "push", "--set-upstream", "origin", "agent/issue-5"],
+            cwd=Path(state["worktree"]), check=True, text=True, capture_output=True, timeout=300,
+        )
+
+    def test_no_arbitrary_external_command_runner_exists(self):
+        self.assertFalse(hasattr(orchestrator, "_run_approved_external"))
+        self.assertEqual(
+            list(__import__("inspect").signature(orchestrator.approved_feature_push).parameters),
+            ["state", "worktree"],
+        )
+
+    def test_non_agent_branch_is_blocked(self):
+        state = self.external_state()
+        state["branch"] = "feature/issue-5"
+        with (
+            mock.patch.object(orchestrator, "git_branch") as branch,
+            mock.patch.object(orchestrator.subprocess, "run") as execute,
+            self.assertRaises(orchestrator.OrchestratorError),
+        ):
+            orchestrator.approved_feature_push(state, Path(state["worktree"]))
+        branch.assert_not_called()
+        execute.assert_not_called()
+
+    def test_dirty_worktree_is_blocked(self):
+        state = self.external_state()
+        with (
+            mock.patch.object(orchestrator, "git_branch", return_value=state["branch"]),
+            mock.patch.object(orchestrator, "git_status", return_value=" M unsafe.txt\n"),
+            mock.patch.object(orchestrator.subprocess, "run") as execute,
+            self.assertRaises(orchestrator.OrchestratorError),
+        ):
+            orchestrator.approved_feature_push(state, Path(state["worktree"]))
+        execute.assert_not_called()
+
+    def test_head_commit_mismatch_is_blocked(self):
+        state = self.external_state()
+        with (
+            mock.patch.object(orchestrator, "git_branch", return_value=state["branch"]),
+            mock.patch.object(orchestrator, "git_status", return_value=""),
+            mock.patch.object(orchestrator, "run_cmd", return_value=mock.Mock(stdout="different\n")),
+            mock.patch.object(orchestrator.subprocess, "run") as execute,
+            self.assertRaises(orchestrator.OrchestratorError),
+        ):
+            orchestrator.approved_feature_push(state, Path(state["worktree"]))
+        execute.assert_not_called()
+
+    def test_clean_matching_agent_branch_and_commit_are_approved(self):
+        state = self.external_state()
+        with (
+            mock.patch.object(orchestrator, "git_branch", return_value=state["branch"]),
+            mock.patch.object(orchestrator, "git_status", return_value=""),
+            mock.patch.object(orchestrator, "run_cmd", side_effect=[
+                mock.Mock(stdout=f"{state['commit']}\n"), mock.Mock(stdout="origin-url\n"),
+            ]),
+        ):
+            self.assertEqual(
+                orchestrator.assert_approved_external_state(state, Path(state["worktree"])),
+                state["branch"],
+            )
+
+    def test_draft_pr_uses_explicit_main_base_and_state_head(self):
+        state = self.external_state()
+        with (
+            mock.patch.object(orchestrator, "assert_approved_external_state", return_value=state["branch"]),
+            mock.patch.object(orchestrator.subprocess, "run", return_value=mock.Mock(stdout="url\n")) as execute,
+        ):
+            orchestrator.approved_draft_pr_create(state, Path(state["worktree"]))
+        execute.assert_called_once_with(
+            ["gh", "pr", "create", "--draft", "--base", "main", "--head", "agent/issue-5", "--fill"],
+            cwd=Path(state["worktree"]), check=True, text=True, capture_output=True, timeout=300,
+        )
+
+    def test_existing_pr_query_uses_head_without_base_and_stops_on_other_base(self):
+        state = self.external_state()
+        other_base_pr = {"baseRefName": "other", "headRefName": state["branch"], "isDraft": True}
+        with (
+            mock.patch.object(orchestrator, "assert_approved_external_state", return_value=state["branch"]),
+            mock.patch.object(orchestrator, "run_cmd", return_value=
+                              mock.Mock(stdout=__import__("json").dumps([other_base_pr]))) as run_cmd,
+            self.assertRaises(orchestrator.OrchestratorError),
+        ):
+            orchestrator.existing_draft_pr(state, Path(state["worktree"]))
+        self.assertEqual(
+            run_cmd.call_args,
+            mock.call(
+                ["gh", "pr", "list", "--state", "open", "--head", state["branch"],
+                 "--json", "number,url,isDraft,baseRefName,headRefName"],
+                cwd=Path(state["worktree"]), timeout=300,
+            ),
+        )
+
+    def test_existing_ready_or_mismatched_pr_stops(self):
+        state = self.external_state()
+        for pr in (
+            {"baseRefName": "main", "headRefName": state["branch"], "isDraft": False},
+            {"baseRefName": "other", "headRefName": state["branch"], "isDraft": True},
+        ):
+            with (
+                mock.patch.object(orchestrator, "assert_approved_external_state", return_value=state["branch"]),
+                mock.patch.object(orchestrator, "run_cmd", return_value=
+                                  mock.Mock(stdout=__import__("json").dumps([pr]))),
+                self.assertRaises(orchestrator.OrchestratorError),
+            ):
+                orchestrator.existing_draft_pr(state, Path(state["worktree"]))
+
+    def test_push_failure_keeps_pushed_false(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state = self.external_state()
+            state.update({
+                "plan": "DECISION: PROCEED", "review": "VERDICT: PASS",
+                "completed_steps": [
+                    "planned", "plan_approved", "worktree_created", "prime_implemented", "checks_initial",
+                    "reviewed", "checks_final", "report_written", "external_approval", "commit_created",
+                ],
+            })
+            with (
+                mock.patch.object(orchestrator, "STATE_FILE", state_file),
+                mock.patch.object(orchestrator, "approved_feature_push", side_effect=orchestrator.OrchestratorError("push failed")),
+                self.assertRaises(orchestrator.OrchestratorError),
+            ):
+                orchestrator.continue_run(state)
+            self.assertFalse(orchestrator.load_json(state_file)["pushed"])
+
+    def test_successful_push_sets_pushed_true(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state = self.external_state()
+            state.update({
+                "plan": "DECISION: PROCEED", "review": "VERDICT: PASS",
+                "completed_steps": [
+                    "planned", "plan_approved", "worktree_created", "prime_implemented", "checks_initial",
+                    "reviewed", "checks_final", "report_written", "external_approval", "commit_created",
+                ],
+            })
+            pr = {"number": 5, "url": "https://example.test/pr/5", "baseRefName": "main", "headRefName": state["branch"], "isDraft": True}
+            with (
+                mock.patch.object(orchestrator, "STATE_FILE", state_file),
+                mock.patch.object(orchestrator, "approved_feature_push") as push,
+                mock.patch.object(orchestrator, "existing_draft_pr", return_value=pr),
+            ):
+                self.assertEqual(orchestrator.continue_run(state), 0)
+            push.assert_called_once()
+            self.assertTrue(orchestrator.load_json(state_file)["pushed"])
+
+    def test_resume_reuses_existing_draft_without_create(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state = self.external_state()
+            state.update({
+                "plan": "DECISION: PROCEED", "review": "VERDICT: PASS", "pushed": True,
+                "completed_steps": [
+                    "planned", "plan_approved", "worktree_created", "prime_implemented", "checks_initial",
+                    "reviewed", "checks_final", "report_written", "external_approval", "commit_created", "branch_pushed",
+                ],
+            })
+            pr = {"number": 5, "url": "https://example.test/pr/5", "baseRefName": "main", "headRefName": state["branch"], "isDraft": True}
+            with (
+                mock.patch.object(orchestrator, "STATE_FILE", state_file),
+                mock.patch.object(orchestrator, "existing_draft_pr", return_value=pr),
+                mock.patch.object(orchestrator, "approved_draft_pr_create") as create,
+            ):
+                self.assertEqual(orchestrator.continue_run(state), 0)
+            create.assert_not_called()
+            saved = orchestrator.load_json(state_file)
+            self.assertEqual(saved["status"], "complete")
+            self.assertEqual(saved["draft_pr"], pr)
 
 
 if __name__ == "__main__":
