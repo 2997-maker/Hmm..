@@ -1,0 +1,4 @@
+# Agent orchestrator local-only data
+.agent/venv/
+.agent/runtime/
+
