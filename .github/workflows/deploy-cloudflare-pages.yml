@@ -23,10 +23,47 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Prepare deployment directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e dist
+          mkdir dist
+          cp index.html dist/index.html
+          cp style.css dist/style.css
+          cp script.js dist/script.js
+
+      - name: Verify deployment contents
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f dist/index.html
+          test -f dist/style.css
+          test -f dist/script.js
+
+          printf '%s\n' index.html script.js style.css | sort > "${RUNNER_TEMP}/expected-files.txt"
+          find dist -type f -printf '%P\n' | sort > "${RUNNER_TEMP}/actual-files.txt"
+          diff -u "${RUNNER_TEMP}/expected-files.txt" "${RUNNER_TEMP}/actual-files.txt"
+
+          grep -Fq 'href="style.css"' dist/index.html
+          grep -Fq 'src="script.js"' dist/index.html
+
+          test ! -e dist/AGENTS.md
+          test ! -e dist/PROJECT_CONTEXT.md
+          test ! -e dist/.agent
+          test ! -e dist/tools
+          test ! -e dist/docs
+          test ! -e dist/requirements-agent.txt
+          test ! -e dist/requirements-agent.lock.txt
+
+          echo "Deployment contents verified:"
+          sed 's/^/  - /' "${RUNNER_TEMP}/actual-files.txt"
+
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy . --project-name=ppppdddd --branch=main
+          command: pages deploy dist --project-name=ppppdddd --branch=main
           gitHubToken: ${{ secrets.GITHUB_TOKEN }}
