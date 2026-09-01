@@ -181,7 +181,7 @@ def assert_command_allowed(args: Sequence[str], *, approved_worktree: Path | Non
     tail = [item.lower() for item in argv[1:]]
     forbidden = (
         (name == "git" and bool(tail) and tail[0] in {"push", "merge"})
-        or (name == "gh" and tail[:2] == ["pr", "create"])
+        or (name == "gh" and tail[:2] in (["pr", "create"], ["pr", "merge"], ["pr", "ready"]))
         or (name == "wrangler" and (tail[:1] == ["deploy"] or tail[:2] == ["pages", "deploy"]))
     )
     if forbidden:
@@ -210,6 +210,84 @@ def run_cmd(
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "출력 없음").strip()
         raise OrchestratorError(f"명령 실패: {command_text(args)}\n{detail}") from exc
+
+
+def assert_approved_external_state(state: dict[str, Any], worktree: Path) -> str:
+    """Validate the state-owned feature branch before an approved external action."""
+    if "external_approval" not in state.get("completed_steps", []):
+        raise OrchestratorError("사용자 최종 승인 전에는 외부 작업을 실행할 수 없습니다.")
+    branch = state.get("branch")
+    if (
+        not isinstance(branch, str) or not branch.startswith("agent/")
+        or branch in PROTECTED_BRANCHES or not re.fullmatch(r"[A-Za-z0-9._/-]+", branch)
+    ):
+        raise OrchestratorError("승인된 상태의 feature branch가 아닙니다.")
+    if not state.get("worktree_owned") or Path(state.get("worktree", "")).resolve() != worktree.resolve():
+        raise OrchestratorError("오케스트레이터 소유로 검증되지 않은 worktree입니다.")
+    if git_branch(worktree) != branch:
+        raise OrchestratorError("현재 branch가 실행 상태의 feature branch와 다릅니다.")
+    if git_status(worktree).strip():
+        raise OrchestratorError("외부 작업 전 worktree가 깨끗해야 합니다.")
+    commit = state.get("commit")
+    head = run_cmd(["git", "rev-parse", "HEAD"], cwd=worktree).stdout.strip()
+    if not isinstance(commit, str) or not commit or head != commit:
+        raise OrchestratorError("현재 HEAD가 실행 상태에 저장된 commit과 다릅니다.")
+    if not run_cmd(["git", "remote", "get-url", "origin"], cwd=worktree).stdout.strip():
+        raise OrchestratorError("origin remote가 구성되어 있지 않습니다.")
+    return branch
+
+
+def approved_feature_push(state: dict[str, Any], worktree: Path) -> None:
+    """Push only the state-owned feature branch to origin with one fixed refspec."""
+    branch = assert_approved_external_state(state, worktree)
+    args = ["git", "push", "--set-upstream", "origin", branch]
+    try:
+        subprocess.run(args, cwd=worktree, check=True, text=True, capture_output=True, timeout=300)
+    except subprocess.TimeoutExpired as exc:
+        raise OrchestratorError(f"명령 시간이 초과되었습니다: {command_text(args)}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "출력 없음").strip()
+        raise OrchestratorError(f"명령 실패: {command_text(args)}\n{detail}") from exc
+
+
+def approved_draft_pr_create(state: dict[str, Any], worktree: Path) -> subprocess.CompletedProcess[str]:
+    """Create only a Draft PR from the state branch to main."""
+    branch = assert_approved_external_state(state, worktree)
+    args = ["gh", "pr", "create", "--draft", "--base", "main", "--head", branch, "--fill"]
+    try:
+        return subprocess.run(
+            args, cwd=worktree, check=True, text=True, capture_output=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise OrchestratorError(f"명령 시간이 초과되었습니다: {command_text(args)}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "출력 없음").strip()
+        raise OrchestratorError(f"명령 실패: {command_text(args)}\n{detail}") from exc
+
+
+def existing_draft_pr(state: dict[str, Any], worktree: Path) -> dict[str, Any] | None:
+    """Return an exactly matching existing Draft PR, or stop on any inconsistency."""
+    branch = assert_approved_external_state(state, worktree)
+    result = run_cmd([
+        "gh", "pr", "list", "--state", "open", "--head", branch,
+        "--json", "number,url,isDraft,baseRefName,headRefName",
+    ], cwd=worktree, timeout=300)
+    try:
+        prs = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise OrchestratorError("GitHub CLI PR 조회 결과를 해석할 수 없습니다.") from exc
+    if not isinstance(prs, list):
+        raise OrchestratorError("GitHub CLI PR 조회 결과 형식이 올바르지 않습니다.")
+    if not prs:
+        return None
+    if len(prs) != 1:
+        raise OrchestratorError("일치하는 기존 PR이 여러 개여서 자동 재사용하지 않습니다.")
+    pr = prs[0]
+    if not isinstance(pr, dict) or (
+        pr.get("baseRefName") != "main" or pr.get("headRefName") != branch or not pr.get("isDraft")
+    ):
+        raise OrchestratorError("기존 PR이 정확히 일치하는 Draft PR이어서만 재사용할 수 있습니다.")
+    return pr
 
 
 def binary(name: str) -> str | None:
@@ -607,21 +685,36 @@ def continue_run(state: dict[str, Any]) -> int:
             print("push와 PR을 실행하지 않았습니다. 필요할 때 `resume`을 실행하세요.")
             return 2
         complete_step(state, "external_approval", "사용자가 feature push 및 Draft PR 승인")
-    branch = state["branch"]
-    if branch in {"main", "master"}:
-        fail(state, "보호 브랜치 push를 차단했습니다.", "feature branch 설정을 확인하세요.")
-    if not git_status(worktree).strip():
-        fail(state, "커밋할 변경사항이 없어 push/PR을 중단했습니다.", "작업 결과와 Prime Agent 로그를 확인하세요.")
-    run_cmd(["git", "add", "--all"], cwd=worktree)
-    run_cmd(["git", "commit", "-m", f"agent: {state['source']}"] , cwd=worktree)
-    state["commit"] = run_cmd(["git", "rev-parse", "HEAD"], cwd=worktree).stdout.strip()
-    save_state(state, "committed", "승인 후 로컬 feature commit 생성")
-    run_cmd(["git", "push", "--set-upstream", "origin", branch], cwd=worktree, timeout=300)
-    state["pushed"] = True
-    save_state(state, "pushed", "승인된 feature branch push 완료")
-    run_cmd(["gh", "pr", "create", "--draft", "--head", branch, "--fill"], cwd=worktree, timeout=300)
+    if "commit_created" not in state["completed_steps"]:
+        if not git_status(worktree).strip():
+            fail(state, "커밋할 변경사항이 없어 push/PR을 중단했습니다.", "작업 결과와 Prime Agent 로그를 확인하세요.")
+        run_cmd(["git", "add", "--all"], cwd=worktree)
+        run_cmd(["git", "commit", "-m", f"agent: {state['source']}"], cwd=worktree)
+        state["commit"] = run_cmd(["git", "rev-parse", "HEAD"], cwd=worktree).stdout.strip()
+        complete_step(state, "commit_created", "승인 후 로컬 feature commit 생성")
+    if not state.get("pushed"):
+        state["pushed"] = False
+        save_state(state, "push_pending", "승인된 feature branch push 시작")
+        try:
+            approved_feature_push(state, worktree)
+        except OrchestratorError as exc:
+            state["pushed"] = False
+            fail(state, "승인된 feature branch push에 실패했습니다.", str(exc))
+        state["pushed"] = True
+        complete_step(state, "branch_pushed", "승인된 feature branch push 완료")
+    if "draft_pr_created" not in state["completed_steps"]:
+        existing = existing_draft_pr(state, worktree)
+        if existing is not None:
+            state["draft_pr"] = existing
+            complete_step(state, "draft_pr_created", "기존의 정확히 일치하는 Draft PR 재사용")
+        else:
+            try:
+                result = approved_draft_pr_create(state, worktree)
+            except OrchestratorError as exc:
+                fail(state, "Draft PR 생성에 실패했습니다.", str(exc))
+            state["draft_pr"] = {"url": result.stdout.strip()} if result.stdout.strip() else {}
+            complete_step(state, "draft_pr_created", "승인된 Draft PR 생성 완료; merge/deploy는 실행하지 않음")
     state["status"] = "complete"
-    complete_step(state, "draft_pr_created", "승인된 Draft PR 생성 완료; merge/deploy는 실행하지 않음")
     save_state(state, "complete", "워크플로 완료")
     return 0
 
