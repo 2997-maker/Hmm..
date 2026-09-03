@@ -34,7 +34,38 @@ SENSITIVE_CHANGE_PATTERNS = (
     re.compile(r"\b(production config|production setting|major (?:package|dependency) upgrade)\b", re.I),
 )
 PLANNER_DECISIONS = {"PROCEED", "NO_CHANGES", "STOP_REQUIRED"}
+TASK_SIZES = {"SMALL", "MEDIUM", "LARGE"}
 PROTECTED_BRANCHES = {"main", "master"}
+FIXED_AUTONOMOUS_GATE = "git diff --check"
+EXECUTION_BUDGET_LIMITS = {
+    "timeout_seconds": 1800,
+    "max_fix_attempts": 3,
+    "max_continuations": 3,
+    "max_turns": 12,
+    "max_tokens": 80_000,
+}
+# These trusted constants are the only source for Prime Agent limits and gates.
+EXECUTION_PROFILES: dict[str, dict[str, Any]] = {
+    "SMALL": {
+        "timeout_seconds": 600, "max_fix_attempts": 1, "autonomous": False,
+        "implementation_instruction": "Handle the task directly and do not use recursive subagents.",
+    },
+    "MEDIUM": {
+        "timeout_seconds": 900, "max_fix_attempts": 2, "autonomous": True,
+        "max_continuations": 2, "max_turns": 8, "max_tokens": 40_000,
+        "implementation_instruction": (
+            "Use subagents sparingly, only for subtasks worth investigating independently."
+        ),
+    },
+    "LARGE": {
+        "timeout_seconds": 1800, "max_fix_attempts": 3, "autonomous": True,
+        "max_continuations": 3, "max_turns": 12, "max_tokens": 80_000,
+        "implementation_instruction": (
+            "Before implementation, break the task into small steps; for independent investigations, "
+            "prefer using `rlm` subagents."
+        ),
+    },
+}
 
 
 class OrchestratorError(RuntimeError):
@@ -120,49 +151,80 @@ def resolved_path(value: str) -> Path | None:
     return Path(located).resolve() if located else None
 
 
+def prime_profile_options(profile: dict[str, Any]) -> list[str]:
+    """Build trusted Prime options; planner text never contributes an option or gate."""
+    options = ["--print"]
+    if profile["autonomous"]:
+        options.extend([
+            "--autonomous", "--autonomous-gate", FIXED_AUTONOMOUS_GATE,
+            "--autonomous-max-continuations", str(profile["max_continuations"]),
+            "--autonomous-max-turns", str(profile["max_turns"]),
+            "--autonomous-max-tokens", str(profile["max_tokens"]),
+            "--autonomous-timeout-ms", str(profile["timeout_seconds"] * 1000),
+        ])
+    return options
+
+
+def prime_argv(command: str, profile: dict[str, Any], worktree: Path, session_dir: Path, prompt: str) -> list[str]:
+    return [command, *prime_profile_options(profile), "--cwd", str(worktree), "--session-dir", str(session_dir), "--", prompt]
+
+
 def assert_prime_command_allowed(args: Sequence[str], approved_worktree: Path) -> None:
-    """Validate Prime Agent's launcher arguments, treating its prompt as data."""
+    """Validate Prime Agent's trusted profile argv, treating its prompt as data."""
     argv = [str(item) for item in args]
     configured = str(load_config()["prime_agent"]["command"])
     allowed_executable = resolved_path(configured)
     actual_executable = resolved_path(argv[0]) if argv else None
     if allowed_executable is None or actual_executable != allowed_executable:
         raise OrchestratorError("허용되지 않은 Prime Agent 실행 파일입니다.")
-
     try:
         separator = argv.index("--", 1)
     except ValueError as exc:
         raise OrchestratorError("Prime Agent 명령에 prompt 구분자 `--`가 없습니다.") from exc
-    options = argv[1:separator]
-    prompt = argv[separator + 1:]
+    options, prompt = argv[1:separator], argv[separator + 1:]
     if len(prompt) != 1:
         raise OrchestratorError("Prime Agent implementer prompt는 단일 데이터 인자여야 합니다.")
-    if options.count("--print") != 1:
-        raise OrchestratorError("Prime Agent는 정확히 한 번 `--print`를 사용해야 합니다.")
-
-    values: dict[str, str] = {}
-    index = 0
-    while index < len(options):
-        option = options[index]
-        if option == "--print":
-            index += 1
-            continue
-        if option not in {"--cwd", "--session-dir"} or index + 1 >= len(options):
-            raise OrchestratorError(f"허용되지 않은 Prime Agent 옵션입니다: {option}")
-        if option in values:
-            raise OrchestratorError(f"Prime Agent 옵션이 중복되었습니다: {option}")
-        values[option] = options[index + 1]
-        index += 2
-
+    try:
+        cwd_index, session_index = options.index("--cwd"), options.index("--session-dir")
+        if cwd_index + 1 >= len(options) or session_index + 1 >= len(options):
+            raise ValueError
+        values = {"--cwd": options[cwd_index + 1], "--session-dir": options[session_index + 1]}
+        profile_options = options[:cwd_index]
+        if options[cwd_index:session_index] != ["--cwd", values["--cwd"]] or options[session_index:] != ["--session-dir", values["--session-dir"]]:
+            raise ValueError
+    except ValueError as exc:
+        raise OrchestratorError("허용되지 않은 Prime Agent 옵션입니다.") from exc
+    allowed_options = [prime_profile_options(execution_profile(size)) for size in TASK_SIZES]
+    if profile_options not in allowed_options:
+        raise OrchestratorError("Prime Agent 옵션은 신뢰된 실행 프로필과 정확히 일치해야 합니다.")
     expected_worktree = approved_worktree.resolve()
     if expected_worktree == ROOT.resolve() or ROOT.resolve() in expected_worktree.parents:
         raise OrchestratorError("Prime Agent --cwd는 저장소 외부의 feature worktree여야 합니다.")
-    if resolved_path(values.get("--cwd", "")) != expected_worktree:
+    if resolved_path(values["--cwd"]) != expected_worktree:
         raise OrchestratorError("Prime Agent --cwd가 승인된 feature worktree와 다릅니다.")
-    session = resolved_path(values.get("--session-dir", ""))
+    session = resolved_path(values["--session-dir"])
     runtime = RUNTIME_DIR.resolve()
     if session is None or session == runtime or runtime not in session.parents:
         raise OrchestratorError("Prime Agent --session-dir은 .agent/runtime 아래여야 합니다.")
+
+
+def verify_prime_cli(profile: dict[str, Any]) -> dict[str, str]:
+    """Check the locally installed CLI without updating or falling back."""
+    command = str(load_config()["prime_agent"]["command"])
+    results: dict[str, str] = {}
+    for flag, label in (("--version", "version"), ("--help", "help")):
+        try:
+            result = subprocess.run([command, flag], check=False, text=True, capture_output=True, timeout=30)
+        except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired) as exc:
+            raise OrchestratorError(f"Prime Agent {flag} 확인을 실행할 수 없습니다.") from exc
+        if result.returncode != 0:
+            raise OrchestratorError(f"Prime Agent {flag} 확인에 실패했습니다.")
+        results[label] = (result.stdout or result.stderr).strip()
+    if profile["autonomous"]:
+        required = {"--autonomous", "--autonomous-gate", "--autonomous-max-continuations", "--autonomous-max-turns", "--autonomous-max-tokens", "--autonomous-timeout-ms"}
+        if not required <= set(re.findall(r"--[a-z-]+", results["help"])):
+            raise OrchestratorError("설치된 Prime Agent가 필요한 autonomous 옵션을 지원하지 않습니다. 업데이트하거나 다른 방식으로 전환하지 않고 중단합니다.")
+    return {"version": results["version"].splitlines()[0] if results["version"] else "(unknown)", "autonomous_supported": str(profile["autonomous"]).lower()}
 
 
 def assert_command_allowed(args: Sequence[str], *, approved_worktree: Path | None = None) -> None:
@@ -432,6 +494,62 @@ def approval(prompt: str) -> bool:
     return answer in {"yes", "y"}
 
 
+def validate_execution_profiles() -> None:
+    """Reject malformed trusted profile constants before they can form an argv."""
+    required = {"timeout_seconds", "max_fix_attempts", "autonomous"}
+    if set(EXECUTION_PROFILES) != TASK_SIZES:
+        raise OrchestratorError("Prime 실행 프로필 정의가 올바르지 않습니다.")
+    for size, profile in EXECUTION_PROFILES.items():
+        if size not in TASK_SIZES or set(profile) - {
+            "timeout_seconds", "max_fix_attempts", "autonomous", "implementation_instruction",
+            "max_continuations", "max_turns", "max_tokens",
+        }:
+            raise OrchestratorError("Prime 실행 프로필 정의가 올바르지 않습니다.")
+        if (
+            not required <= set(profile)
+            or not isinstance(profile["autonomous"], bool)
+            or not isinstance(profile.get("implementation_instruction"), str)
+            or not profile["implementation_instruction"].strip()
+        ):
+            raise OrchestratorError("Prime 실행 프로필 정의가 올바르지 않습니다.")
+        numeric = ["timeout_seconds", "max_fix_attempts"]
+        numeric += ["max_continuations", "max_turns", "max_tokens"] if profile["autonomous"] else []
+        if any(
+            not isinstance(profile[key], int)
+            or isinstance(profile[key], bool)
+            or profile[key] <= 0
+            or profile[key] > EXECUTION_BUDGET_LIMITS[key]
+            for key in numeric
+        ):
+            raise OrchestratorError("Prime 실행 프로필 예산은 허용 상한 이내의 양의 정수여야 합니다.")
+        autonomous_keys = {"max_continuations", "max_turns", "max_tokens"}
+        if profile["autonomous"] != (autonomous_keys <= set(profile)) or (not profile["autonomous"] and autonomous_keys & set(profile)):
+            raise OrchestratorError("Prime autonomous 프로필 정의가 올바르지 않습니다.")
+
+
+def execution_profile(size: str) -> dict[str, Any]:
+    validate_execution_profiles()
+    if size not in TASK_SIZES:
+        raise OrchestratorError("허용되지 않은 TASK_SIZE입니다.")
+    return {"task_size": size, **EXECUTION_PROFILES[size]}
+
+
+def planner_task_size(text: str) -> tuple[str, str]:
+    """Parse required size fields only from planner lines two and three."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 3:
+        raise OrchestratorError("PROCEED 계획의 두 번째와 세 번째 비어 있지 않은 줄에는 TASK_SIZE와 TASK_SIZE_REASON이 필요합니다.")
+    size_match = re.fullmatch(r"TASK_SIZE: (SMALL|MEDIUM|LARGE)", lines[1])
+    reason_match = re.fullmatch(r"TASK_SIZE_REASON: (.+)", lines[2])
+    later_fields = any(
+        line.startswith("TASK_SIZE:") or line.startswith("TASK_SIZE_REASON:")
+        for line in lines[3:]
+    )
+    if not size_match or not reason_match or later_fields:
+        raise OrchestratorError("TASK_SIZE와 TASK_SIZE_REASON은 각각 두 번째와 세 번째 비어 있지 않은 줄에 한 번만, 올바른 형식으로 있어야 합니다.")
+    return size_match.group(1), reason_match.group(1)
+
+
 def planner_decision(text: str) -> str:
     """Return the exact decision from the planner's first non-empty line."""
     first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
@@ -450,6 +568,7 @@ def terminal_planner_report(state: dict[str, Any], outcome: str, message: str) -
     report = (
         f"# Agent Orchestrator Report\n\nRun: `{state['run_id']}`\n\n"
         f"Status: `complete`\n\nOutcome: `{outcome}`\n\n"
+        f"## Execution profile\n\n```json\n{json.dumps(state.get('execution_profile', {}), ensure_ascii=False, indent=2)}\n```\n\n"
         f"## Result\n\n{message}\n\n## Planner response\n\n{state['plan']}\n"
     )
     REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -548,15 +667,16 @@ def run_prime(state: dict[str, Any], correction: str | None = None) -> None:
     session_dir = RUNTIME_DIR / "prime-sessions" / state["run_id"]
     session_dir.mkdir(parents=True, exist_ok=True)
     base = (AGENT_DIR / "prompts" / "implementer.md").read_text(encoding="utf-8")
-    prompt = correction or f"{base}\n\nAPPROVED PLAN:\n{state['plan']}\n\nTASK:\n{state['task']}"
-    command = [
-        config["prime_agent"]["command"], "--print", "--cwd", str(worktree),
-        "--session-dir", str(session_dir), "--", prompt,
-    ]
+    profile = execution_profile(state["task_size"])
+    state["execution_profile"] = profile
+    implementation_instruction = profile["implementation_instruction"]
+    task_prompt = correction or f"{base}\n\nAPPROVED PLAN:\n{state['plan']}\n\nTASK:\n{state['task']}"
+    prompt = f"{task_prompt}\n\nTRUSTED IMPLEMENTATION INSTRUCTION:\n{implementation_instruction}"
+    command = prime_argv(config["prime_agent"]["command"], profile, worktree, session_dir, prompt)
     child_env = prime_env()
     result = run_cmd(
         command, cwd=worktree, env=child_env, check=False,
-        timeout=int(config["prime_agent"]["timeout_seconds"]), approved_prime_worktree=worktree,
+        timeout=int(profile["timeout_seconds"]), approved_prime_worktree=worktree,
     )
     state.setdefault("prime_runs", []).append({
         "at": now(), "returncode": result.returncode, "stdout_tail": redact_secrets(result.stdout[-8000:], child_env),
@@ -595,6 +715,7 @@ def final_report(state: dict[str, Any]) -> None:
     report = (
         f"# Agent Orchestrator Report\n\nRun: `{state['run_id']}`\n\n"
         f"Status: `{state['status']}`\n\nBranch: `{state.get('branch', '-')}`\n\n"
+        f"## Execution profile\n\n```json\n{json.dumps(state.get('execution_profile', {}), ensure_ascii=False, indent=2)}\n```\n\n"
         f"## Changed files\n\n```text\n{changed}\n```\n\n"
         f"## Diff summary\n\n```text\n{diffstat}\n```\n\n"
         f"## Review\n\n{state.get('review', '(not run)')}\n\n"
@@ -608,12 +729,41 @@ def final_report(state: dict[str, Any]) -> None:
     complete_step(state, "report_written", f"최종 보고서 작성: {REPORT_FILE}")
 
 
+def invalidate_stale_fix_review(state: dict[str, Any]) -> None:
+    """Migrate a pre-review-status FIX resume to a fresh review and downstream output."""
+    if "review_status" in state or "reviewed" not in state["completed_steps"]:
+        return
+    verdict = re.search(r"VERDICT:\s*(PASS|FIX|STOP)", state.get("review", ""), re.I)
+    if not verdict or verdict.group(1).upper() != "FIX":
+        return
+    externally_advanced = bool(
+        {"external_approval", "commit_created", "branch_pushed", "draft_pr_created"}
+        & set(state["completed_steps"])
+        or state.get("commit")
+        or state.get("pushed")
+        or state.get("draft_pr")
+    )
+    if externally_advanced:
+        fail(
+            state,
+            "외부 승인 또는 commit/push/Draft PR 이후 stale FIX 검토를 발견해 안전하게 중단했습니다.",
+            "외부 상태와 변경사항을 사람이 확인한 뒤 새 실행 여부를 결정하세요.",
+        )
+    invalidated = {"reviewed", "checks_final", "report_written"}
+    state["completed_steps"] = [step for step in state["completed_steps"] if step not in invalidated]
+    state.get("checks", {}).pop("final", None)
+    state.pop("report", None)
+    state["review_status"] = "pending"
+    save_state(state, "stale_review_invalidated", "stale FIX 검토와 최종 검사/보고서를 무효화")
+
+
 def continue_run(state: dict[str, Any]) -> int:
     if state.get("dry_run"):
         complete_step(state, "dry_run_complete", "dry-run 완료: 외부 작업과 Prime Agent를 실행하지 않음")
         state["status"] = "complete"
         save_state(state, "complete", "dry-run 정상 종료")
         return 0
+    invalidate_stale_fix_review(state)
     if "planned" not in state["completed_steps"]:
         thread_id, plan = codex_turn("planner", state["task"], ROOT)
         state["planner_thread_id"] = thread_id
@@ -625,6 +775,17 @@ def continue_run(state: dict[str, Any]) -> int:
     except OrchestratorError as exc:
         fail(state, str(exc), "planner 프롬프트와 응답의 DECISION 첫 줄 형식을 확인하세요.")
     state["planner_decision"] = decision
+    if decision == "PROCEED":
+        try:
+            task_size, task_size_reason = planner_task_size(state["plan"])
+            profile = execution_profile(task_size)
+            state.update({"task_size": task_size, "task_size_reason": task_size_reason, "execution_profile": profile})
+            state["prime_cli"] = verify_prime_cli(profile)
+        except OrchestratorError as exc:
+            message = f"Prime 실행 전 안전하게 중단했습니다: {exc}"
+            terminal_planner_report(state, "stop_required", message)
+            print(message)
+            return 0
     save_state(state, "planned", f"planner 판정: {decision}")
     if decision == "NO_CHANGES":
         message = "변경할 필요가 없어 안전하게 종료했습니다"
@@ -655,23 +816,39 @@ def continue_run(state: dict[str, Any]) -> int:
         if not run_checks(state, worktree, "initial"):
             fail(state, "초기 프로젝트 검사가 실패했습니다.", "검사 로그를 확인하고 resume 하세요.")
         complete_step(state, "checks_initial", "저장소에 실제 존재하는 초기 검사 완료")
-    if "reviewed" not in state["completed_steps"]:
-        snapshot = review_snapshot(worktree)
-        review_task = f"TASK:\n{state['task']}\n\nAPPROVED PLAN:\n{state['plan']}\n\nCHANGES:\n{snapshot}"
-        thread_id, review = codex_turn("reviewer", review_task, worktree)
-        state["reviewer_thread_id"] = thread_id
-        state["review"] = review
-        complete_step(state, "reviewed", "별도 Codex reviewer thread가 읽기 전용 검수 완료")
-    verdict = re.search(r"VERDICT:\s*(PASS|FIX|STOP)", state["review"], re.I)
-    verdict_text = verdict.group(1).upper() if verdict else "STOP"
-    if verdict_text == "STOP":
-        fail(state, "검수가 STOP이거나 판정 형식이 올바르지 않습니다.", "review 결과를 사람이 확인하세요.")
-    if verdict_text == "FIX" and "prime_fixed" not in state["completed_steps"]:
-        if state["fix_attempts"] >= 1:
+    # A correction can be interrupted after its attempt was persisted.  Such a
+    # resumed run must obtain a new review, not reuse the stale FIX verdict.
+    if "review_status" not in state:
+        old_verdict = re.search(r"VERDICT:\s*(PASS|FIX|STOP)", state.get("review", ""), re.I)
+        state["review_status"] = "pass" if "reviewed" in state["completed_steps"] and old_verdict and old_verdict.group(1).upper() == "PASS" else "pending"
+    if state["review_status"] != "pass":
+        state["completed_steps"] = [step for step in state["completed_steps"] if step != "reviewed"]
+        state["review_status"] = "pending"
+    while True:
+        if "reviewed" not in state["completed_steps"]:
+            snapshot = review_snapshot(worktree)
+            review_task = f"TASK:\n{state['task']}\n\nAPPROVED PLAN:\n{state['plan']}\n\nCHANGES:\n{snapshot}"
+            thread_id, review = codex_turn("reviewer", review_task, worktree)
+            state["reviewer_thread_id"] = thread_id
+            state["review"] = review
+            complete_step(state, "reviewed", "별도 Codex reviewer thread가 읽기 전용 검수 완료")
+        verdict = re.search(r"VERDICT:\s*(PASS|FIX|STOP)", state["review"], re.I)
+        verdict_text = verdict.group(1).upper() if verdict else "STOP"
+        if verdict_text == "STOP":
+            fail(state, "검수가 STOP이거나 판정 형식이 올바르지 않습니다.", "review 결과를 사람이 확인하세요.")
+        if verdict_text == "PASS":
+            state["review_status"] = "pass"
+            save_state(state, "review_passed", "독립 검수 통과")
+            break
+        if state["fix_attempts"] >= state["execution_profile"]["max_fix_attempts"]:
             fail(state, "Prime Agent 재수정 한도를 초과했습니다.", "남은 문제를 사람이 수정하세요.")
         state["fix_attempts"] += 1
-        save_state(state, "fix_requested", "Prime Agent 재수정 1회 요청")
+        state["review_status"] = "fix_requested"
+        save_state(state, "fix_requested", f"Prime Agent 재수정 {state['fix_attempts']}회 요청")
         run_prime(state, f"다음 독립 검수 지적만 수정하세요. 외부 작업은 금지됩니다.\n\n{state['review']}")
+        state["completed_steps"].remove("reviewed")
+        state["review_status"] = "pending"
+        save_state(state, "review_requested", "수정 후 독립 재검수 요청")
     if "checks_final" not in state["completed_steps"]:
         if not run_checks(state, worktree, "final"):
             fail(state, "최종 프로젝트 검사가 실패했습니다.", "검사 로그와 변경사항을 확인하세요.")

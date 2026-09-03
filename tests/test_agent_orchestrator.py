@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import importlib.util
 import io
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +30,7 @@ class PlannerDecisionTests(unittest.TestCase):
                 mock.patch.object(orchestrator, "approval", return_value=False) as approval,
                 mock.patch.object(orchestrator, "create_worktree") as create_worktree,
                 mock.patch.object(orchestrator, "run_prime") as run_prime,
+                mock.patch.object(orchestrator, "verify_prime_cli", return_value={"version": "0.8.1", "autonomous_supported": "false"}),
             ):
                 result = orchestrator.continue_run(state)
                 saved = orchestrator.load_json(state_file)
@@ -59,7 +61,7 @@ class PlannerDecisionTests(unittest.TestCase):
 
     def test_proceed_moves_to_approval(self):
         result, state, _, approval, worktree, prime = self.run_plan(
-            "DECISION: PROCEED\nSTOP_REQUIRED, 데이터베이스, 인증, 배포는 모두 불필요"
+            "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: 좁은 테스트 변경입니다.\nSTOP_REQUIRED, 데이터베이스, 인증, 배포는 모두 불필요"
         )
         self.assertEqual(result, 2)
         self.assertEqual(state["status"], "awaiting_plan_approval")
@@ -85,6 +87,109 @@ class PlannerDecisionTests(unittest.TestCase):
     def test_invalid_decision_is_format_error(self):
         with self.assertRaises(orchestrator.OrchestratorError):
             self.run_plan("DECISION: MAYBE\n변경 계획입니다")
+
+
+class ExecutionProfileTests(unittest.TestCase):
+    def setUp(self):
+        self.worktree = Path("/tmp/agent-test-worktree")
+        self.session = orchestrator.RUNTIME_DIR / "prime-sessions" / "test-run"
+        self.prompt = "implement trusted plan"
+
+    def test_each_size_builds_its_trusted_argv(self):
+        expected = {
+            "SMALL": ["--print"],
+            "MEDIUM": ["--print", "--autonomous", "--autonomous-gate", "git diff --check", "--autonomous-max-continuations", "2", "--autonomous-max-turns", "8", "--autonomous-max-tokens", "40000", "--autonomous-timeout-ms", "900000"],
+            "LARGE": ["--print", "--autonomous", "--autonomous-gate", "git diff --check", "--autonomous-max-continuations", "3", "--autonomous-max-turns", "12", "--autonomous-max-tokens", "80000", "--autonomous-timeout-ms", "1800000"],
+        }
+        for size, options in expected.items():
+            profile = orchestrator.execution_profile(size)
+            argv = orchestrator.prime_argv("prime-agent", profile, self.worktree, self.session, self.prompt)
+            self.assertEqual(argv, ["prime-agent", *options, "--cwd", str(self.worktree), "--session-dir", str(self.session), "--", self.prompt])
+
+    def test_proceed_requires_exact_size_and_reason(self):
+        self.assertEqual(orchestrator.planner_task_size("DECISION: PROCEED\nTASK_SIZE: MEDIUM\nTASK_SIZE_REASON: Two independent files."), ("MEDIUM", "Two independent files."))
+        for response in (
+            "DECISION: PROCEED\nTASK_SIZE_REASON: missing size",
+            "DECISION: PROCEED\nTASK_SIZE: HUGE\nTASK_SIZE_REASON: invalid size",
+            "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON:",
+            "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE: LARGE\nTASK_SIZE_REASON: duplicate",
+            "DECISION: PROCEED\nExplanation before fields\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: delayed",
+            "DECISION: PROCEED\nTASK_SIZE_REASON: reversed\nTASK_SIZE: SMALL",
+            "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: valid\nTASK_SIZE: LARGE",
+        ):
+            with self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator.planner_task_size(response)
+
+    def test_invalid_profile_budgets_are_rejected(self):
+        owners = {
+            "timeout_seconds": "SMALL",
+            "max_fix_attempts": "SMALL",
+            "max_continuations": "MEDIUM",
+            "max_turns": "MEDIUM",
+            "max_tokens": "MEDIUM",
+        }
+        for field, size in owners.items():
+            for value in (0, -1, True, "1", orchestrator.EXECUTION_BUDGET_LIMITS[field] + 1):
+                with self.subTest(field=field, value=value):
+                    profiles = {name: dict(profile) for name, profile in orchestrator.EXECUTION_PROFILES.items()}
+                    profiles[size][field] = value
+                    with mock.patch.object(orchestrator, "EXECUTION_PROFILES", profiles), self.assertRaises(orchestrator.OrchestratorError):
+                        orchestrator.validate_execution_profiles()
+
+    def test_profile_values_remain_exact(self):
+        expected = {
+            "SMALL": {"timeout_seconds": 600, "max_fix_attempts": 1, "autonomous": False},
+            "MEDIUM": {
+                "timeout_seconds": 900, "max_fix_attempts": 2, "autonomous": True,
+                "max_continuations": 2, "max_turns": 8, "max_tokens": 40_000,
+            },
+            "LARGE": {
+                "timeout_seconds": 1800, "max_fix_attempts": 3, "autonomous": True,
+                "max_continuations": 3, "max_turns": 12, "max_tokens": 80_000,
+            },
+        }
+        for size, values in expected.items():
+            profile = orchestrator.execution_profile(size)
+            self.assertEqual({key: profile[key] for key in values}, values)
+
+    def test_untrusted_gate_is_rejected_by_command_validation(self):
+        profile = orchestrator.execution_profile("MEDIUM")
+        argv = orchestrator.prime_argv("/opt/prime/bin/prime-agent", profile, self.worktree, self.session, self.prompt)
+        argv[argv.index("git diff --check")] = "git diff --check; git push"
+        config = {"prime_agent": {"command": "/opt/prime/bin/prime-agent"}}
+        with (
+            mock.patch.object(orchestrator, "load_config", return_value=config),
+            mock.patch.object(orchestrator, "resolved_path", side_effect=lambda value: Path(value).resolve()),
+            self.assertRaises(orchestrator.OrchestratorError),
+        ):
+            orchestrator.assert_prime_command_allowed(argv, self.worktree)
+
+    def test_invalid_size_stops_before_approval_or_worktree(self):
+        state = orchestrator.new_state("task", "text", False)
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"),
+                mock.patch.object(orchestrator, "REPORT_FILE", Path(directory) / "report.md"),
+                mock.patch.object(orchestrator, "codex_turn", return_value=("thread", "DECISION: PROCEED\nTASK_SIZE: HUGE\nTASK_SIZE_REASON: invalid")),
+                mock.patch.object(orchestrator, "approval") as approval,
+                mock.patch.object(orchestrator, "create_worktree") as create_worktree,
+            ):
+                self.assertEqual(orchestrator.continue_run(state), 0)
+        approval.assert_not_called()
+        create_worktree.assert_not_called()
+        self.assertEqual(state["outcome"], "stop_required")
+
+    def test_final_report_records_profile(self):
+        state = orchestrator.new_state("task", "text", False)
+        state.update({"status": "complete", "worktree": str(self.worktree), "execution_profile": orchestrator.execution_profile("MEDIUM")})
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(orchestrator, "REPORT_FILE", Path(directory) / "report.md"),
+            mock.patch.object(orchestrator, "run_cmd", return_value=mock.Mock(stdout="")),
+            mock.patch.object(orchestrator, "complete_step"),
+        ):
+            orchestrator.final_report(state)
+            self.assertIn('"task_size": "MEDIUM"', (Path(directory) / "report.md").read_text())
 
 
 class CommandSafetyTests(unittest.TestCase):
@@ -380,7 +485,7 @@ class ExternalApprovalTests(unittest.TestCase):
             state_file = Path(directory) / "state.json"
             state = self.external_state()
             state.update({
-                "plan": "DECISION: PROCEED", "review": "VERDICT: PASS",
+                "plan": "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: test", "review": "VERDICT: PASS",
                 "completed_steps": [
                     "planned", "plan_approved", "worktree_created", "prime_implemented", "checks_initial",
                     "reviewed", "checks_final", "report_written", "external_approval", "commit_created",
@@ -399,7 +504,7 @@ class ExternalApprovalTests(unittest.TestCase):
             state_file = Path(directory) / "state.json"
             state = self.external_state()
             state.update({
-                "plan": "DECISION: PROCEED", "review": "VERDICT: PASS",
+                "plan": "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: test", "review": "VERDICT: PASS",
                 "completed_steps": [
                     "planned", "plan_approved", "worktree_created", "prime_implemented", "checks_initial",
                     "reviewed", "checks_final", "report_written", "external_approval", "commit_created",
@@ -420,7 +525,7 @@ class ExternalApprovalTests(unittest.TestCase):
             state_file = Path(directory) / "state.json"
             state = self.external_state()
             state.update({
-                "plan": "DECISION: PROCEED", "review": "VERDICT: PASS", "pushed": True,
+                "plan": "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: test", "review": "VERDICT: PASS", "pushed": True,
                 "completed_steps": [
                     "planned", "plan_approved", "worktree_created", "prime_implemented", "checks_initial",
                     "reviewed", "checks_final", "report_written", "external_approval", "commit_created", "branch_pushed",
@@ -437,6 +542,183 @@ class ExternalApprovalTests(unittest.TestCase):
             saved = orchestrator.load_json(state_file)
             self.assertEqual(saved["status"], "complete")
             self.assertEqual(saved["draft_pr"], pr)
+
+
+class PrimeExecutionTests(unittest.TestCase):
+    def test_each_profile_adds_exact_trusted_implementation_instruction(self):
+        expected = {
+            "SMALL": "Handle the task directly and do not use recursive subagents.",
+            "MEDIUM": "Use subagents sparingly, only for subtasks worth investigating independently.",
+            "LARGE": (
+                "Before implementation, break the task into small steps; for independent investigations, "
+                "prefer using `rlm` subagents."
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime"
+            for size, instruction in expected.items():
+                state = orchestrator.new_state("untrusted issue text", "text", False)
+                state.update({
+                    "run_id": f"prompt-{size}", "worktree": "/tmp/agent-test-worktree",
+                    "task_size": size,
+                    "plan": "DECISION: PROCEED\n--autonomous-max-tokens 999999",
+                    "execution_profile": orchestrator.execution_profile(size),
+                })
+                state["execution_profile"]["implementation_instruction"] = "untrusted persisted instruction"
+                with (
+                    mock.patch.object(orchestrator, "RUNTIME_DIR", runtime),
+                    mock.patch.object(orchestrator, "assert_feature_worktree"),
+                    mock.patch.object(orchestrator, "run_cmd", return_value=mock.Mock(returncode=0, stdout="", stderr="")) as run_cmd,
+                    mock.patch.object(orchestrator, "complete_step"),
+                ):
+                    orchestrator.run_prime(state)
+                prompt = run_cmd.call_args.args[0][-1]
+                self.assertTrue(prompt.endswith(f"TRUSTED IMPLEMENTATION INSTRUCTION:\n{instruction}"))
+                self.assertEqual(prompt.count(instruction), 1)
+                self.assertNotIn("untrusted persisted instruction", prompt)
+
+    def test_profile_timeout_is_the_outer_prime_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime"
+            for size, expected_timeout in (("SMALL", 600), ("MEDIUM", 900), ("LARGE", 1800)):
+                state = orchestrator.new_state("task", "text", False)
+                state.update({
+                    "run_id": f"timeout-{size}", "worktree": "/tmp/agent-test-worktree",
+                    "task_size": size,
+                    "plan": "DECISION: PROCEED", "execution_profile": orchestrator.execution_profile(size),
+                })
+                with (
+                    mock.patch.object(orchestrator, "RUNTIME_DIR", runtime),
+                    mock.patch.object(orchestrator, "assert_feature_worktree"),
+                    mock.patch.object(orchestrator, "run_cmd", return_value=mock.Mock(returncode=0, stdout="", stderr="")) as run_cmd,
+                    mock.patch.object(orchestrator, "complete_step"),
+                ):
+                    orchestrator.run_prime(state)
+                self.assertEqual(run_cmd.call_args.kwargs["timeout"], expected_timeout)
+
+    def test_cli_inspection_failures_are_orchestrator_errors(self):
+        profile = orchestrator.execution_profile("MEDIUM")
+        for error in (FileNotFoundError(), PermissionError(), subprocess.TimeoutExpired(["prime-agent", "--version"], 30)):
+            with (
+                mock.patch.object(orchestrator, "load_config", return_value={"prime_agent": {"command": "prime-agent"}}),
+                mock.patch.object(orchestrator.subprocess, "run", side_effect=error),
+                self.assertRaises(orchestrator.OrchestratorError),
+            ):
+                orchestrator.verify_prime_cli(profile)
+
+    def test_cli_inspection_error_takes_safe_stop_required_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = orchestrator.new_state("task", "text", False)
+            plan = "DECISION: PROCEED\nTASK_SIZE: MEDIUM\nTASK_SIZE_REASON: test"
+            with (
+                mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"),
+                mock.patch.object(orchestrator, "REPORT_FILE", Path(directory) / "report.md"),
+                mock.patch.object(orchestrator, "codex_turn", return_value=("planner", plan)),
+                mock.patch.object(orchestrator, "verify_prime_cli", side_effect=orchestrator.OrchestratorError("unavailable")),
+                mock.patch.object(orchestrator, "approval") as approval,
+                mock.patch.object(orchestrator, "create_worktree") as create_worktree,
+            ):
+                self.assertEqual(orchestrator.continue_run(state), 0)
+            self.assertEqual(state["outcome"], "stop_required")
+            approval.assert_not_called()
+            create_worktree.assert_not_called()
+
+    def test_cli_inspection_rejects_failed_and_unsupported_cli(self):
+        profile = orchestrator.execution_profile("MEDIUM")
+        with (
+            mock.patch.object(orchestrator, "load_config", return_value={"prime_agent": {"command": "prime-agent"}}),
+            mock.patch.object(orchestrator.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="", stderr="bad")),
+            self.assertRaises(orchestrator.OrchestratorError),
+        ):
+            orchestrator.verify_prime_cli(profile)
+        with (
+            mock.patch.object(orchestrator, "load_config", return_value={"prime_agent": {"command": "prime-agent"}}),
+            mock.patch.object(orchestrator.subprocess, "run", side_effect=[
+                mock.Mock(returncode=0, stdout="prime 1.0", stderr=""),
+                mock.Mock(returncode=0, stdout="--autonomous", stderr=""),
+            ]),
+            self.assertRaises(orchestrator.OrchestratorError),
+        ):
+            orchestrator.verify_prime_cli(profile)
+
+
+class ReviewRetryTests(unittest.TestCase):
+    def stale_fix_state(self):
+        state = orchestrator.new_state("task", "text", False)
+        state.update({
+            "worktree": "/tmp/agent-test-worktree",
+            "plan": "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: test",
+            "review": "VERDICT: FIX\nold finding",
+            "checks": {"final": {"old": "result"}},
+            "report": "/tmp/old-report.md",
+            "completed_steps": [
+                "planned", "plan_approved", "worktree_created", "prime_implemented", "checks_initial",
+                "reviewed", "checks_final", "report_written",
+            ],
+        })
+        return state
+
+    def test_resume_invalidates_stale_fix_then_reviews_checks_and_reports_again(self):
+        state = self.stale_fix_state()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"),
+            mock.patch.object(orchestrator, "verify_prime_cli", return_value={"version": "test"}),
+            mock.patch.object(orchestrator, "review_snapshot", return_value="fresh diff"),
+            mock.patch.object(orchestrator, "codex_turn", return_value=("new-reviewer", "VERDICT: PASS\nfresh")) as reviewer,
+            mock.patch.object(orchestrator, "run_checks", return_value=True) as checks,
+            mock.patch.object(orchestrator, "final_report", side_effect=lambda current: orchestrator.complete_step(current, "report_written", "new report")) as report,
+            mock.patch.object(orchestrator, "approval", return_value=False),
+        ):
+            self.assertEqual(orchestrator.continue_run(state), 2)
+        reviewer.assert_called_once()
+        checks.assert_called_once_with(state, Path(state["worktree"]), "final")
+        report.assert_called_once_with(state)
+        self.assertEqual(state["review"], "VERDICT: PASS\nfresh")
+        self.assertNotIn("old", state["checks"].get("final", {}))
+
+    def test_stale_fix_after_external_progress_stops_without_new_review(self):
+        for marker in ("external_approval", "commit_created", "branch_pushed", "draft_pr_created"):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
+                state = self.stale_fix_state()
+                state["completed_steps"].append(marker)
+                with (
+                    mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"),
+                    mock.patch.object(orchestrator, "verify_prime_cli", return_value={"version": "test"}),
+                    mock.patch.object(orchestrator, "codex_turn") as reviewer,
+                    self.assertRaises(orchestrator.OrchestratorError),
+                ):
+                    orchestrator.continue_run(state)
+                reviewer.assert_not_called()
+                self.assertIn("reviewed", state["completed_steps"])
+                self.assertIn("checks_final", state["completed_steps"])
+                self.assertIn("report_written", state["completed_steps"])
+
+    def test_each_profile_retries_and_re_reviews_through_its_limit(self):
+        for size, limit in (("SMALL", 1), ("MEDIUM", 2), ("LARGE", 3)):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as directory:
+                state = orchestrator.new_state("task", "text", False)
+                state.update({
+                    "worktree": "/tmp/agent-test-worktree",
+                    "plan": f"DECISION: PROCEED\nTASK_SIZE: {size}\nTASK_SIZE_REASON: test",
+                    "execution_profile": orchestrator.execution_profile(size),
+                    "completed_steps": ["planned", "plan_approved", "worktree_created", "prime_implemented", "checks_initial"],
+                })
+                reviews = [("review", "VERDICT: FIX")] * limit + [("review", "VERDICT: PASS")]
+                with (
+                    mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"),
+                    mock.patch.object(orchestrator, "verify_prime_cli", return_value={"version": "test"}),
+                    mock.patch.object(orchestrator, "codex_turn", side_effect=reviews) as reviewer,
+                    mock.patch.object(orchestrator, "review_snapshot", return_value="diff"),
+                    mock.patch.object(orchestrator, "run_prime") as run_prime,
+                    mock.patch.object(orchestrator, "run_checks", return_value=True),
+                    mock.patch.object(orchestrator, "final_report", side_effect=lambda current: orchestrator.complete_step(current, "report_written", "report")),
+                    mock.patch.object(orchestrator, "approval", return_value=False),
+                ):
+                    self.assertEqual(orchestrator.continue_run(state), 2)
+                self.assertEqual(run_prime.call_count, limit)
+                self.assertEqual(reviewer.call_count, limit + 1)
+                self.assertEqual(state["fix_attempts"], limit)
 
 
 if __name__ == "__main__":
