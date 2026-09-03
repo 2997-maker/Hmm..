@@ -36,7 +36,7 @@ The launcher automatically re-executes itself with the dedicated interpreter whe
 - It creates only `gh pr create --draft --base main --head <state branch> --fill`. On resume it skips completed commits and pushes, and reuses only one existing PR whose base, head, and Draft status exactly match; Ready or inconsistent PRs stop the run.
 - `main` and `master` are never direct modification or push targets. Merge and deployment are never automated.
 - Database, authentication, production configuration, or major dependency changes stop the workflow.
-- Prime Agent can receive at most one correction request after independent review.
+- Prime Agent correction limits are selected from the trusted execution profile described below.
 - Every durable step is written atomically beneath `.agent/runtime`; `resume` continues the saved run.
 
 The forbidden-command checks are defense in depth, not a complete security sandbox. Prime Agent is a local
@@ -72,3 +72,15 @@ contains changes or when ownership cannot be proven.
 
 To uninstall after cleanup, remove `.agent/venv`, `.agent/runtime`, and the automation files. Remove only the
 clearly marked orchestrator section from `AGENTS.md` and the two orchestrator entries from `.gitignore`.
+
+## Prime execution profiles
+
+For `DECISION: PROCEED`, the planner must provide one exact `TASK_SIZE` (`SMALL`, `MEDIUM`, or `LARGE`) and a one-line `TASK_SIZE_REASON`. Missing or invalid values stop before approval or worktree creation. Execution budgets, gates, and Prime implementation instructions come only from trusted code constants; GitHub issue text and planner output cannot supply command options.
+
+| Profile | Autonomous | Continuations | Turns | Tokens | Timeout | Maximum fixes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| SMALL | No | — | — | — | 600 seconds | 1 |
+| MEDIUM | Yes | 2 | 8 | 40000 | 900 seconds | 2 |
+| LARGE | Yes | 3 | 12 | 80000 | 1800 seconds | 3 |
+
+The autonomous gate is fixed to exactly `git diff --check`. Passing that gate alone does not mean the overall run succeeded: repository checks and a fresh independent Codex review must also pass. The selected profile and budgets are saved in runtime state and the final report.
