@@ -129,6 +129,30 @@ class HermesAdvisorTests(unittest.TestCase):
             self.assertEqual(call.kwargs["env"], {"PATH": "/bin"})
             self.assertTrue(call.kwargs["cwd"].name.startswith("hermes-advisor-preflight-"))
 
+    def test_preflight_checks_oauth_in_fixed_advisor_profile(self):
+        def hermes_result(argv, **_kwargs):
+            if argv == ["/usr/bin/hermes", "--version"]:
+                return mock.Mock(returncode=0, stdout="hermes v0.21.0", stderr="")
+            if argv == ["/usr/bin/hermes", "profile", "show", "orchestrator-advisor"]:
+                return mock.Mock(returncode=0, stdout="Path: /profile", stderr="")
+            if argv == ["/usr/bin/hermes", "-p", "orchestrator-advisor", "auth", "status", "openai-codex"]:
+                return mock.Mock(returncode=0, stdout="logged in", stderr="")
+            if argv == ["/usr/bin/hermes", "auth", "status", "openai-codex"]:
+                return mock.Mock(returncode=1, stdout="logged out", stderr="")
+            self.fail(f"unexpected Hermes command: {argv}")
+
+        with mock.patch.object(orchestrator, "binary", return_value="/usr/bin/hermes"), mock.patch.object(orchestrator.subprocess, "run", side_effect=hermes_result) as run:
+            self.assertEqual(orchestrator.verify_hermes(), ("/usr/bin/hermes", "/profile"))
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["/usr/bin/hermes", "--version"],
+                ["/usr/bin/hermes", "profile", "show", "orchestrator-advisor"],
+                ["/usr/bin/hermes", "-p", "orchestrator-advisor", "auth", "status", "openai-codex"],
+            ],
+        )
+
     def test_preflight_failures_are_sanitized_persisted_and_stop_before_approval(self):
         ok_version = mock.Mock(returncode=0, stdout="hermes v0.21.0", stderr="")
         ok_profile = mock.Mock(returncode=0, stdout="Path: /profile", stderr="")
