@@ -15,10 +15,26 @@
     "timeout_seconds": 1800
   },
   "checks": {
-    "lint": null,
+    "lint": [
+      "node",
+      "--check",
+      "script.js"
+    ],
     "typecheck": null,
-    "test": null,
-    "build": null
+    "test": [
+      "python",
+      "-m",
+      "unittest",
+      "discover",
+      "-s",
+      "tests",
+      "-p",
+      "test_*.py",
+      "-v"
+    ],
+    "build": [
+      "python",
+      "tools/verify_static_site.py"
+    ]
   }
 }
-

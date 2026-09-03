@@ -54,9 +54,7 @@ After the second approval, confirm that:
 
 ## Checks
 
-The orchestrator discovers scripts that actually exist in `package.json`. Missing lint, typecheck, test, or
-build commands are recorded as `SKIPPED`, never invented. Commands may also be explicitly configured in
-`.agent/config.json`.
+The orchestrator runs only configured commands or scripts that actually exist in `package.json`. This repository configures direct argv commands for `node --check script.js`, full Python unittest discovery, and `python tools/verify_static_site.py`; the latter reads `index.html` local stylesheet/script references and the workflow's explicit `dist` deployment allowlist without writing files. `typecheck` remains `SKIPPED` because this static site has no typechecker. Any nonzero configured check records `FAIL` and stops the run before review can succeed.
 
 ## GitHub authentication
 
