@@ -54,7 +54,7 @@ After the second approval, confirm that:
 
 ## Checks
 
-The orchestrator runs only configured commands or scripts that actually exist in `package.json`. This repository configures direct argv commands for `node --check script.js`, full Python unittest discovery, and `python tools/verify_static_site.py`; the latter reads `index.html` local stylesheet/script references and the workflow's explicit `dist` deployment allowlist without writing files. `typecheck` remains `SKIPPED` because this static site has no typechecker. Any nonzero configured check records `FAIL` and stops the run before review can succeed.
+The orchestrator runs only configured commands or scripts that actually exist in `package.json`. This repository configures direct argv commands for `node --check script.js`, full Python unittest discovery, and `python tools/verify_static_site.py`; the latter reads `index.html` local stylesheet/script references and the workflow's explicit `dist` deployment allowlist without writing files. A `PASS` result for lint, test, or build means its configured command ran and exited with status zero. `typecheck` remains `SKIPPED` because this static site has no typechecker. Any nonzero configured check records `FAIL` and stops the run before review can succeed.
 
 ## GitHub authentication
 
