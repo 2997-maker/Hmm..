@@ -28,6 +28,16 @@ SENSITIVE_ENV_NAMES = {
     "GITHUB_TOKEN", "GH_TOKEN", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
     "CF_API_TOKEN", "CF_API_KEY", "CF_ACCOUNT_ID",
 }
+HERMES_PROFILE = "orchestrator-advisor"
+HERMES_PROVIDER = "openai-codex"
+HERMES_MODEL = "gpt-5.6-sol"
+HERMES_REASONING = "high"
+HERMES_TOOLSETS = "todo"
+HERMES_MAX_TURNS = 1
+HERMES_RUN_BUDGET_SECONDS = 120
+HERMES_MAX_REVIEWS = 2
+HERMES_MAX_REPLANS = 1
+HERMES_FORBIDDEN_FLAGS = {"--yolo", "--safe-mode", "--ignore-rules", "--gateway", "gateway", "setup", "update", "auth", "login", "logout", "codex"}
 SENSITIVE_CHANGE_PATTERNS = (
     re.compile(r"\b(database|migration|schema migration)\b", re.I),
     re.compile(r"\b(authentication|auth provider|oauth|sso)\b", re.I),
@@ -227,13 +237,19 @@ def verify_prime_cli(profile: dict[str, Any]) -> dict[str, str]:
     return {"version": results["version"].splitlines()[0] if results["version"] else "(unknown)", "autonomous_supported": str(profile["autonomous"]).lower()}
 
 
-def assert_command_allowed(args: Sequence[str], *, approved_worktree: Path | None = None) -> None:
+def assert_command_allowed(
+    args: Sequence[str], *, approved_worktree: Path | None = None,
+    approved_hermes_executable: str | None = None,
+) -> None:
     """Inspect executable and argv structure without scanning ordinary data arguments."""
     argv = [str(item) for item in args]
     if not argv:
         raise OrchestratorError("빈 명령은 실행할 수 없습니다.")
     name = executable_name(argv[0])
     configured_prime = str(load_config()["prime_agent"]["command"])
+    if name == "hermes":
+        assert_hermes_command_allowed(argv, approved_hermes_executable)
+        return
     if name == executable_name(configured_prime):
         if approved_worktree is None:
             raise OrchestratorError("Prime Agent 실행에는 승인된 feature worktree가 필요합니다.")
@@ -260,8 +276,12 @@ def run_cmd(
     args: Sequence[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None,
     check: bool = True, timeout: int | None = 120, input_text: str | None = None,
     approved_prime_worktree: Path | None = None,
+    approved_hermes_executable: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    assert_command_allowed(args, approved_worktree=approved_prime_worktree)
+    assert_command_allowed(
+        args, approved_worktree=approved_prime_worktree,
+        approved_hermes_executable=approved_hermes_executable,
+    )
     try:
         return subprocess.run(
             [str(item) for item in args], cwd=cwd, env=env, check=check, text=True,
@@ -550,6 +570,200 @@ def planner_task_size(text: str) -> tuple[str, str]:
     return size_match.group(1), reason_match.group(1)
 
 
+def hermes_config() -> dict[str, Any]:
+    """The advisor boundary is fixed in code, not task/config supplied."""
+    return {"profile": HERMES_PROFILE, "provider": HERMES_PROVIDER, "model": HERMES_MODEL,
+            "reasoning": HERMES_REASONING, "toolsets": HERMES_TOOLSETS,
+            "max_turns": HERMES_MAX_TURNS, "run_budget_seconds": HERMES_RUN_BUDGET_SECONDS,
+            "one_shot": True, "source": "tool", "repository_access": False}
+
+
+def validate_hermes_config() -> None:
+    if hermes_config() != {"profile": "orchestrator-advisor", "provider": "openai-codex", "model": "gpt-5.6-sol", "reasoning": "high", "toolsets": "todo", "max_turns": 1, "run_budget_seconds": 120, "one_shot": True, "source": "tool", "repository_access": False}:
+        raise OrchestratorError("Hermes advisor 신뢰 설정이 올바르지 않습니다.")
+
+
+def hermes_argv(command: str = "hermes") -> list[str]:
+    validate_hermes_config()
+    return [command, "chat", "--profile", HERMES_PROFILE, "--query-file", "-", "--oneshot", "--quiet",
+            "--provider", HERMES_PROVIDER, "--model", HERMES_MODEL, "--reasoning", HERMES_REASONING,
+            "--toolsets", HERMES_TOOLSETS, "--max-turns", str(HERMES_MAX_TURNS),
+            "--run-budget", str(HERMES_RUN_BUDGET_SECONDS), "--source", "tool"]
+
+
+def assert_hermes_command_allowed(args: Sequence[str], approved_executable: str | None = None) -> None:
+    argv = [str(value) for value in args]
+    # The advisor command is a single trusted argv, including its executable.
+    # Do not accept another binary merely because it happens to be named hermes.
+    expected_executable = approved_executable or "hermes"
+    if argv != hermes_argv(expected_executable):
+        raise OrchestratorError("허용되지 않은 Hermes advisor 명령입니다.")
+    if approved_executable is not None and not Path(approved_executable).is_absolute():
+        raise OrchestratorError("Hermes advisor의 검증된 실행 경로는 절대 경로여야 합니다.")
+    if any(value.lower() in HERMES_FORBIDDEN_FLAGS for value in argv[1:]):
+        raise OrchestratorError("허용되지 않은 Hermes advisor 옵션입니다.")
+
+
+def hermes_env(profile_home: str | None = None) -> dict[str, str]:
+    """Give Hermes only runtime basics; credentials remain in its managed auth store."""
+    env = {name: value for name, value in os.environ.items() if name in {"PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM"}}
+    if profile_home:
+        env["HERMES_HOME"] = profile_home
+    return env
+
+
+def hermes_decision(text: str) -> str:
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    match = re.fullmatch(r"DECISION: (PASS|REVISE|STOP)", first)
+    if not match:
+        raise OrchestratorError("Hermes 응답 형식 오류: 첫 번째 비어 있지 않은 줄은 DECISION: PASS, DECISION: REVISE, DECISION: STOP 중 하나여야 합니다.")
+    return match.group(1)
+
+
+def hermes_query(state: dict[str, Any]) -> str:
+    return ("You are a read-only plan advisor. Do not access repository files or request tools. "
+            "Reply with exactly DECISION: PASS, DECISION: REVISE, or DECISION: STOP as your first non-empty line, then concise sanitized advice.\n\n"
+            f"TASK:\n{state['task']}\n\nCODEX PLAN:\n{state['plan']}")
+
+
+class HermesPreflightError(OrchestratorError):
+    """A sanitized, durable classification for Hermes preflight failures."""
+
+    def __init__(self, failure_type: str, message: str):
+        super().__init__(message)
+        self.failure_type = failure_type
+
+
+def verify_hermes() -> tuple[str, str]:
+    """Check Hermes from an empty directory with no inherited credentials."""
+    validate_hermes_config()
+    located = binary("hermes")
+    command = str(Path(located).resolve()) if located else ""
+    if not command:
+        raise HermesPreflightError("executable_missing", "Hermes 실행 파일을 확인할 수 없습니다.")
+    # Preflight has the same remoteness and credential boundary as chat.
+    with tempfile.TemporaryDirectory(prefix="hermes-advisor-preflight-") as directory:
+        kwargs = {"text": True, "capture_output": True, "timeout": 30,
+                  "cwd": Path(directory), "env": hermes_env()}
+        try:
+            version = subprocess.run([command, "--version"], **kwargs)
+            profile = subprocess.run([command, "profile", "show", HERMES_PROFILE], **kwargs)
+            auth = subprocess.run([command, "auth", "status", HERMES_PROVIDER], **kwargs)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            failure_type = "executable_missing" if isinstance(exc, (FileNotFoundError, PermissionError)) else "preflight_unavailable"
+            raise HermesPreflightError(failure_type, "Hermes 사전 점검을 실행할 수 없습니다.") from exc
+    if version.returncode or "v0.21.0" not in (version.stdout + version.stderr):
+        raise HermesPreflightError("executable_unavailable", "Hermes 실행 파일 호환성을 확인할 수 없습니다.")
+    if profile.returncode:
+        raise HermesPreflightError("profile_missing", "Hermes advisor 프로필을 확인할 수 없습니다.")
+    if auth.returncode or re.search(r"logged out|not logged", auth.stdout + auth.stderr, re.I):
+        raise HermesPreflightError("authentication_unavailable", "Hermes provider 인증을 확인할 수 없습니다.")
+    match = re.search(r"^Path:\s+(.+)$", profile.stdout + profile.stderr, re.M)
+    if not match:
+        raise HermesPreflightError("profile_missing", "Hermes advisor 프로필 경로를 확인할 수 없습니다.")
+    return command, match.group(1).strip()
+
+
+def sanitize_hermes_advice(stdout: str) -> str:
+    """Keep useful prose, never credential-shaped or auth-file output."""
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    advice: list[str] = []
+    unsafe = re.compile(
+        r"(?i)auth\.json|bearer\s+|oauth|token\s*[=:]|(?:secret|password|credential|authorization|api[_-]?key)\s*[=:]|"
+        r'["\'](?:access_token|refresh_token|id_token|client_secret|password|credentials?)["\']\s*:'
+    )
+    for line in lines[1:]:
+        if not unsafe.search(line):
+            advice.append(line)
+    return redact_secrets("\n".join(advice))[-8000:] or "(no sanitized advice)"
+
+
+def hermes_failure_type(exc: BaseException) -> str:
+    cause = exc.__cause__
+    if isinstance(exc, subprocess.TimeoutExpired) or isinstance(cause, subprocess.TimeoutExpired):
+        return "timeout"
+    if isinstance(exc, PermissionError) or isinstance(cause, PermissionError):
+        return "permission_error"
+    if isinstance(exc, (FileNotFoundError, OSError)) or isinstance(cause, (FileNotFoundError, OSError)):
+        return "command_launch_failure"
+    return "execution_error"
+
+
+def run_hermes_review(state: dict[str, Any]) -> str:
+    """Run once, atomically persist its result, then let the caller consume it."""
+    state["hermes_config"] = hermes_config()
+    state.setdefault("hermes_review_count", 0)
+    state["hermes_preflight_phase"] = "started"
+    save_state(state, "hermes_preflight_started", "Hermes advisor 고정 설정 및 사전 점검 시작 상태 저장")
+    try:
+        command, profile_home = verify_hermes()
+    except HermesPreflightError as exc:
+        state.setdefault("hermes_reviews", []).append({
+            "at": now(), "decision": "ERROR", "failure_type": exc.failure_type,
+            "config": hermes_config(), "credentials_stripped": True,
+        })
+        state["hermes_last_decision"] = "ERROR"
+        state["hermes_failure_type"] = exc.failure_type
+        state["hermes_preflight_phase"] = "failed"
+        state["hermes_review_phase"] = "preflight_failed"
+        save_state(state, "hermes_preflight_failed", f"Hermes advisor 사전 점검 실패 저장: {exc.failure_type}")
+        raise OrchestratorError(f"Hermes advisor 사전 점검이 실패했습니다 ({exc.failure_type}).") from exc
+    state["hermes_preflight_phase"] = "completed"
+    child_env = hermes_env(profile_home)
+    state["hermes_review_count"] = state.get("hermes_review_count", 0) + 1
+    state["hermes_review_phase"] = "started"
+    save_state(state, "hermes_review_started", "Hermes advisor 검토 시작 상태 저장")
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-advisor-") as directory:
+            result = run_cmd(
+                hermes_argv(command), cwd=Path(directory), env=child_env, check=False,
+                timeout=HERMES_RUN_BUDGET_SECONDS + 10, input_text=hermes_query(state),
+                approved_hermes_executable=command,
+            )
+    except (OrchestratorError, OSError, subprocess.TimeoutExpired) as exc:
+        failure_type = hermes_failure_type(exc)
+        state.setdefault("hermes_reviews", []).append({
+            "at": now(), "decision": "ERROR", "failure_type": failure_type,
+            "config": hermes_config(), "credentials_stripped": True,
+        })
+        state["hermes_config"] = hermes_config()
+        state["hermes_last_decision"] = "ERROR"
+        state["hermes_failure_type"] = failure_type
+        state["hermes_review_phase"] = "result_ready"
+        save_state(state, "hermes_review_result", f"Hermes advisor 실패 저장: {failure_type}")
+        raise OrchestratorError(f"Hermes advisor 실행이 실패했습니다 ({failure_type}).") from exc
+    raw_output = result.stdout or ""
+    # Parse all raw stdout. A tail must never choose a different decision.
+    parse_error: OrchestratorError | None = None
+    if result.returncode != 0:
+        decision = "ERROR"
+    else:
+        try:
+            decision = hermes_decision(raw_output)
+        except OrchestratorError as exc:
+            decision, parse_error = "FORMAT_ERROR", exc
+    failure_type = "nonzero_exit" if result.returncode != 0 else ("invalid_response" if parse_error else None)
+    record = {"at": now(), "returncode": result.returncode, "decision": decision,
+              "config": hermes_config(), "credentials_stripped": True}
+    if not failure_type:
+        record["advice"] = sanitize_hermes_advice(raw_output)
+    if failure_type:
+        record["failure_type"] = failure_type
+    state.setdefault("hermes_reviews", []).append(record)
+    state["hermes_config"] = hermes_config()
+    state["hermes_last_decision"] = decision
+    if failure_type:
+        state["hermes_failure_type"] = failure_type
+    state["hermes_review_phase"] = "result_ready"
+    # This save is intentionally before the next state transition, for resume idempotence.
+    save_state(state, "hermes_review_result", f"Hermes advisor 결과 저장: {decision}")
+    if result.returncode != 0:
+        raise OrchestratorError("Hermes advisor 실행이 실패했습니다.")
+    if parse_error:
+        raise parse_error
+    return decision
+
+
 def planner_decision(text: str) -> str:
     """Return the exact decision from the planner's first non-empty line."""
     first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
@@ -569,7 +783,12 @@ def terminal_planner_report(state: dict[str, Any], outcome: str, message: str) -
         f"# Agent Orchestrator Report\n\nRun: `{state['run_id']}`\n\n"
         f"Status: `complete`\n\nOutcome: `{outcome}`\n\n"
         f"## Execution profile\n\n```json\n{json.dumps(state.get('execution_profile', {}), ensure_ascii=False, indent=2)}\n```\n\n"
-        f"## Result\n\n{message}\n\n## Planner response\n\n{state['plan']}\n"
+        f"## Result\n\n{message}\n\n"
+        f"## Hermes advisor\n\n```json\n{json.dumps(state.get('hermes_config', {}), ensure_ascii=False, indent=2)}\n```\n\n"
+        f"Reviews: `{state.get('hermes_review_count', 0)}`; last decision: `{state.get('hermes_last_decision', '(not run)')}`\n\n"
+        f"Failure type: `{state.get('hermes_failure_type', '(none)')}`\n\n"
+        f"Advice:\n\n{state.get('hermes_reviews', [])[-1].get('advice', '(not run)') if state.get('hermes_reviews') else '(not run)'}\n\n"
+        f"## Planner response\n\n{state['plan']}\n"
     )
     REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
     REPORT_FILE.write_text(report, encoding="utf-8")
@@ -647,13 +866,24 @@ def prime_env() -> dict[str, str]:
 
 
 def redact_secrets(text: str, env: dict[str, str] | None = None) -> str:
+    """Remove known secrets and credential-shaped values before persistence."""
     redacted = text
-    source = env or os.environ
+    # A stripped child environment cannot identify credentials withheld by its parent.
+    source = dict(os.environ)
+    if env:
+        source.update(env)
     for name, value in source.items():
         upper = name.upper()
-        if value and len(value) >= 8 and any(marker in upper for marker in ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL")):
+        if value and len(value) >= 8 and any(marker in upper for marker in ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "OAUTH", "AUTH")):
             redacted = redacted.replace(value, "[REDACTED]")
-    redacted = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}", r"\1[REDACTED]", redacted)
+    token_value = r"(?:[A-Za-z0-9._~+/=-]{8,}|eyJ[A-Za-z0-9._-]+)"
+    sensitive_field = r"(?:access_token|refresh_token|id_token|oauth_token|client_secret|client_password|api[_-]?key|secret|password|passphrase|credential(?:s)?|authorization|auth(?:entication)?(?:[_-]?(?:token|secret|key|password))?)"
+    # This handles auth.json/OAuth objects as well as shell and URL key-value output.
+    json_field = r"(?ix)([\"']" + sensitive_field + r"[\"']\s*:\s*)[\"'](?:[^\"'\\]|\\.)*[\"']"
+    redacted = re.sub(json_field, r'\1"[REDACTED]"', redacted)
+    redacted = re.sub(r"(?ix)(?:\b|[?&])" + sensitive_field + r"\s*[=:]\s*[\"']?" + token_value, "[REDACTED]", redacted)
+    redacted = re.sub(r"(?i)(bearer\s+)" + token_value, r"\1[REDACTED]", redacted)
+    redacted = re.sub(r"(?i)\b(?:sk|rk|pk|gh[opsru])-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", redacted)
     return redacted
 
 
@@ -718,6 +948,10 @@ def final_report(state: dict[str, Any]) -> None:
         f"## Execution profile\n\n```json\n{json.dumps(state.get('execution_profile', {}), ensure_ascii=False, indent=2)}\n```\n\n"
         f"## Changed files\n\n```text\n{changed}\n```\n\n"
         f"## Diff summary\n\n```text\n{diffstat}\n```\n\n"
+        f"## Hermes advisor\n\n```json\n{json.dumps(state.get('hermes_config', {}), ensure_ascii=False, indent=2)}\n```\n\n"
+        f"Reviews: `{state.get('hermes_review_count', 0)}`; last decision: `{state.get('hermes_last_decision', '(not run)')}`\n\n"
+        f"Failure type: `{state.get('hermes_failure_type', '(none)')}`\n\n"
+        f"Advice:\n\n{state.get('hermes_reviews', [])[-1].get('advice', '(not run)') if state.get('hermes_reviews') else '(not run)'}\n\n"
         f"## Review\n\n{state.get('review', '(not run)')}\n\n"
         f"## Checks\n\n```json\n{json.dumps(state.get('checks', {}), ensure_ascii=False, indent=2)}\n```\n\n"
         "## Remaining risks\n\nPrime Agent command filtering is defense in depth, not a complete sandbox. "
@@ -776,6 +1010,87 @@ def continue_run(state: dict[str, Any]) -> int:
         fail(state, str(exc), "planner 프롬프트와 응답의 DECISION 첫 줄 형식을 확인하세요.")
     state["planner_decision"] = decision
     if decision == "PROCEED":
+        # Hermes is deliberately before both Prime preflight and the first approval/worktree.
+        # Older persisted runs that already passed approval cannot be safely sent backward.
+        while "plan_approved" not in state["completed_steps"] and "hermes_reviewed" not in state["completed_steps"]:
+            if state.get("hermes_review_phase") == "started":
+                failure_type = "interrupted_review"
+                state.setdefault("hermes_reviews", []).append({
+                    "at": now(), "decision": "ERROR", "failure_type": failure_type,
+                    "config": state.get("hermes_config", hermes_config()), "credentials_stripped": True,
+                })
+                state["hermes_review_phase"] = "ambiguous"
+                state["hermes_last_decision"] = "ERROR"
+                state["hermes_failure_type"] = failure_type
+                save_state(state, "hermes_review_ambiguous", "중단된 Hermes advisor 검토를 안전 중단 상태로 저장")
+                message = "이전 Hermes 검토 호출이 중단되어 성공 여부가 불명확합니다. 재실행하지 않았으며 사용자가 상태를 수동 확인한 뒤 복구해야 합니다."
+                terminal_planner_report(state, "stop_required", message)
+                print(message)
+                return 0
+            if state.get("hermes_replan_pending"):
+                if state.get("hermes_replan_phase") == "started":
+                    message = "Hermes 재계획 호출 중 중단되어 성공 여부를 확인할 수 없으므로 수동 확인이 필요합니다."
+                    terminal_planner_report(state, "stop_required", message)
+                    print(message)
+                    return 0
+                feedback = state.get("hermes_reviews", [{}])[-1].get("advice", "Revise the plan to address Hermes advisor feedback.")
+                try:
+                    state["hermes_replan_phase"] = "started"
+                    save_state(state, "hermes_replan_started", "Codex planner 재계획 호출 시작 상태 저장")
+                    thread_id, plan = codex_turn("planner", f"{state['task']}\n\nHERMES ADVISOR FEEDBACK (revise the plan once):\n{feedback}", ROOT)
+                    state["planner_thread_id"] = thread_id
+                    state["plan"] = plan
+                    state["planner_decision"] = planner_decision(plan)
+                    if state["planner_decision"] != "PROCEED":
+                        raise OrchestratorError("Hermes 재계획 뒤 planner가 PROCEED를 반환하지 않았습니다.")
+                except OrchestratorError as exc:
+                    message = f"Hermes 재계획 단계에서 안전하게 중단했습니다: {exc}"
+                    terminal_planner_report(state, "stop_required", message)
+                    print(message)
+                    return 0
+                state.pop("hermes_replan_pending", None)
+                state["hermes_replan_phase"] = "completed"
+                state.pop("hermes_review_phase", None)
+                save_state(state, "hermes_replanned", "Codex planner가 Hermes 피드백으로 계획을 한 번 재작성")
+                continue
+            if state.get("hermes_review_count", 0) >= HERMES_MAX_REVIEWS:
+                message = "Hermes advisor 재검토 한도에서 PASS가 아니어서 사용자 개입이 필요합니다."
+                terminal_planner_report(state, "stop_required", message)
+                print(message)
+                return 0
+            # A completed call is saved as result_ready before any transition.
+            # Resume consumes that durable result rather than contacting Hermes again.
+            if state.get("hermes_review_phase") == "result_ready":
+                hermes_result = state.get("hermes_last_decision", "FORMAT_ERROR")
+            else:
+                try:
+                    hermes_result = run_hermes_review(state)
+                except OrchestratorError as exc:
+                    message = f"Hermes advisor 단계에서 안전하게 중단했습니다: {exc}"
+                    terminal_planner_report(state, "stop_required", message)
+                    print(message)
+                    return 0
+            if hermes_result == "PASS":
+                complete_step(state, "hermes_reviewed", "Hermes 읽기 전용 계획 검토 통과")
+                break
+            if hermes_result == "STOP":
+                message = "Hermes advisor가 STOP을 반환하여 승인과 worktree 생성 전에 안전하게 중단했습니다."
+                terminal_planner_report(state, "stop_required", message)
+                print(message)
+                return 0
+            if hermes_result != "REVISE":
+                message = f"Hermes advisor의 저장된 오류 결과({hermes_result})로 승인 전에 안전하게 중단했습니다."
+                terminal_planner_report(state, "stop_required", message)
+                print(message)
+                return 0
+            if state.get("hermes_replans", 0) >= HERMES_MAX_REPLANS or state.get("hermes_review_count", 0) >= HERMES_MAX_REVIEWS:
+                message = "Hermes advisor 재검토 한도에서 PASS가 아니어서 사용자 개입이 필요합니다."
+                terminal_planner_report(state, "stop_required", message)
+                print(message)
+                return 0
+            state["hermes_replans"] = state.get("hermes_replans", 0) + 1
+            state["hermes_replan_pending"] = True
+            save_state(state, "hermes_replan_requested", "Hermes REVISE 피드백으로 Codex planner 재계획 요청")
         try:
             task_size, task_size_reason = planner_task_size(state["plan"])
             profile = execution_profile(task_size)

@@ -31,6 +31,7 @@ class PlannerDecisionTests(unittest.TestCase):
                 mock.patch.object(orchestrator, "create_worktree") as create_worktree,
                 mock.patch.object(orchestrator, "run_prime") as run_prime,
                 mock.patch.object(orchestrator, "verify_prime_cli", return_value={"version": "0.8.1", "autonomous_supported": "false"}),
+                mock.patch.object(orchestrator, "run_hermes_review", return_value="PASS"),
             ):
                 result = orchestrator.continue_run(state)
                 saved = orchestrator.load_json(state_file)
@@ -87,6 +88,232 @@ class PlannerDecisionTests(unittest.TestCase):
     def test_invalid_decision_is_format_error(self):
         with self.assertRaises(orchestrator.OrchestratorError):
             self.run_plan("DECISION: MAYBE\n변경 계획입니다")
+
+
+class HermesAdvisorTests(unittest.TestCase):
+    def test_argv_is_fixed_and_query_is_stdin_data(self):
+        argv = orchestrator.hermes_argv()
+        self.assertEqual(argv, ["hermes", "chat", "--profile", "orchestrator-advisor", "--query-file", "-", "--oneshot", "--quiet", "--provider", "openai-codex", "--model", "gpt-5.6-sol", "--reasoning", "high", "--toolsets", "todo", "--max-turns", "1", "--run-budget", "120", "--source", "tool"])
+        orchestrator.assert_hermes_command_allowed(argv)
+        with self.assertRaises(orchestrator.OrchestratorError): orchestrator.assert_hermes_command_allowed([*argv, "--yolo"])
+
+    def test_parser_and_environment_are_strict(self):
+        self.assertEqual(orchestrator.hermes_decision("\n DECISION: PASS\ntext"), "PASS")
+        for output in ("", "DECISION: MAYBE", "text\nDECISION: PASS", "DECISION: PASS extra"):
+            with self.subTest(output=output):
+                with self.assertRaises(orchestrator.OrchestratorError): orchestrator.hermes_decision(output)
+        with mock.patch.dict(orchestrator.os.environ, {"PATH": "/bin", "GITHUB_TOKEN": "secret", "DEPLOY_KEY": "secret"}, clear=True): env = orchestrator.hermes_env("/safe/profile")
+        self.assertEqual(env, {"PATH": "/bin", "HERMES_HOME": "/safe/profile"})
+
+    def test_review_uses_empty_temp_cwd_stdin_and_persists_advice(self):
+        state = orchestrator.new_state("task", "text", False); state["plan"] = "plan"
+        completed = subprocess.CompletedProcess([], 0, "DECISION: PASS\nadvice", "")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"), mock.patch.object(orchestrator, "verify_hermes", return_value=("/usr/bin/hermes", "/profile")), mock.patch.object(orchestrator, "run_cmd", return_value=completed) as run:
+            self.assertEqual(orchestrator.run_hermes_review(state), "PASS")
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], orchestrator.hermes_argv("/usr/bin/hermes")); self.assertEqual(kwargs["input_text"], orchestrator.hermes_query(state))
+        self.assertEqual(kwargs["approved_hermes_executable"], "/usr/bin/hermes")
+        self.assertTrue(Path(kwargs["cwd"]).name.startswith("hermes-advisor-")); self.assertNotEqual(Path(kwargs["cwd"]), orchestrator.ROOT)
+        self.assertEqual(state["hermes_review_count"], 1)
+
+    def test_preflight_uses_stripped_environment_and_empty_cwd(self):
+        results = [
+            mock.Mock(returncode=0, stdout="hermes v0.21.0", stderr=""),
+            mock.Mock(returncode=0, stdout="Path: /profile", stderr=""),
+            mock.Mock(returncode=0, stdout="logged in", stderr=""),
+        ]
+        with mock.patch.object(orchestrator, "binary", return_value="/usr/bin/hermes"), mock.patch.dict(orchestrator.os.environ, {"PATH": "/bin", "GITHUB_TOKEN": "secret"}, clear=True), mock.patch.object(orchestrator.subprocess, "run", side_effect=results) as run:
+            self.assertEqual(orchestrator.verify_hermes(), ("/usr/bin/hermes", "/profile"))
+        self.assertEqual(run.call_count, 3)
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["env"], {"PATH": "/bin"})
+            self.assertTrue(call.kwargs["cwd"].name.startswith("hermes-advisor-preflight-"))
+
+    def test_preflight_failures_are_sanitized_persisted_and_stop_before_approval(self):
+        ok_version = mock.Mock(returncode=0, stdout="hermes v0.21.0", stderr="")
+        ok_profile = mock.Mock(returncode=0, stdout="Path: /profile", stderr="")
+        cases = (
+            ("executable_missing", None, []),
+            ("profile_missing", "/usr/bin/hermes", [ok_version, mock.Mock(returncode=1, stdout="", stderr="oauth-secret"), mock.Mock(returncode=0, stdout="logged in", stderr="")]),
+            ("authentication_unavailable", "/usr/bin/hermes", [ok_version, ok_profile, mock.Mock(returncode=1, stdout="logged out", stderr="oauth-secret")]),
+        )
+        for expected, executable, preflight_results in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                state = orchestrator.new_state("task", "text", False)
+                state.update({"plan": "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: test", "completed_steps": ["planned"]})
+                state_file = Path(directory) / "state.json"
+                report_file = Path(directory) / "report.md"
+                with mock.patch.object(orchestrator, "STATE_FILE", state_file), mock.patch.object(orchestrator, "REPORT_FILE", report_file), mock.patch.object(orchestrator, "binary", return_value=executable), mock.patch.object(orchestrator.subprocess, "run", side_effect=preflight_results) as process, mock.patch.object(orchestrator, "approval") as approval, mock.patch.object(orchestrator, "create_worktree") as worktree:
+                    self.assertEqual(orchestrator.continue_run(state), 0)
+                approval.assert_not_called()
+                worktree.assert_not_called()
+                if expected == "executable_missing":
+                    process.assert_not_called()
+                self.assertEqual(state["hermes_review_count"], 0)
+                self.assertEqual(state["hermes_failure_type"], expected)
+                self.assertEqual(state["hermes_last_decision"], "ERROR")
+                self.assertEqual(state["hermes_preflight_phase"], "failed")
+                self.assertEqual(state["hermes_reviews"][-1]["failure_type"], expected)
+                self.assertEqual(state["hermes_config"], orchestrator.hermes_config())
+                persisted = state_file.read_text()
+                report = report_file.read_text()
+                self.assertIn(expected, persisted)
+                self.assertIn(expected, report)
+                self.assertNotIn("oauth-secret", persisted + report)
+
+    def test_review_parses_full_raw_stdout_and_redacts_parent_oauth(self):
+        state = orchestrator.new_state("task", "text", False); state["plan"] = "plan"
+        raw = "DECISION: REVISE\naccess_token=parent-secret-value\n" + ("x" * 8_100) + "\nDECISION: PASS"
+        completed = subprocess.CompletedProcess([], 0, raw, "Bearer child-token-value")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"), mock.patch.dict(orchestrator.os.environ, {"OAUTH_TOKEN": "parent-secret-value"}, clear=True), mock.patch.object(orchestrator, "verify_hermes", return_value=("/usr/bin/hermes", "/profile")), mock.patch.object(orchestrator, "run_cmd", return_value=completed):
+            self.assertEqual(orchestrator.run_hermes_review(state), "REVISE")
+        record = state["hermes_reviews"][-1]
+        self.assertNotIn("parent-secret-value", record["advice"])
+        self.assertNotIn("stderr_tail", record)
+        self.assertEqual(state["hermes_review_phase"], "result_ready")
+
+    def test_review_redacts_oauth_auth_json_and_generic_credential_fields(self):
+        state = orchestrator.new_state("task", "text", False); state["plan"] = "plan"
+        secrets = {
+            "client_secret": "oauth-client-secret-value",
+            "password": "oauth-password-value",
+            "credentials": "generic-credential-value",
+            "access_token": "oauth-access-token-value",
+        }
+        raw = "DECISION: PASS\n" + __import__("json").dumps(secrets)
+        stderr = "auth.json credential=stderr-credential-value authorization=Bearer stderr-bearer-token-value"
+        completed = subprocess.CompletedProcess([], 0, raw, stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            report_file = Path(directory) / "report.md"
+            with mock.patch.object(orchestrator, "STATE_FILE", state_file), mock.patch.object(orchestrator, "REPORT_FILE", report_file), mock.patch.object(orchestrator, "verify_hermes", return_value=("/usr/bin/hermes", "/profile")), mock.patch.object(orchestrator, "run_cmd", return_value=completed):
+                self.assertEqual(orchestrator.run_hermes_review(state), "PASS")
+                orchestrator.terminal_planner_report(state, "stop_required", "test")
+            persisted = state_file.read_text()
+            report = report_file.read_text()
+        for secret in (*secrets.values(), "stderr-credential-value", "stderr-bearer-token-value"):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, persisted)
+                self.assertNotIn(secret, report)
+        for marker in ("client_secret", "access_token", "auth.json", "stderr_tail"):
+            self.assertNotIn(marker, persisted)
+            self.assertNotIn(marker, report)
+
+    def test_review_failures_are_persisted_before_nonzero_or_format_error(self):
+        for result in (
+            subprocess.CompletedProcess([], 1, "output", "error"),
+            subprocess.CompletedProcess([], 0, "not a decision", ""),
+        ):
+            with self.subTest(returncode=result.returncode), tempfile.TemporaryDirectory() as directory:
+                state = orchestrator.new_state("task", "text", False); state["plan"] = "plan"
+                with mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"), mock.patch.object(orchestrator, "verify_hermes", return_value=("/usr/bin/hermes", "/profile")), mock.patch.object(orchestrator, "run_cmd", return_value=result), self.assertRaises(orchestrator.OrchestratorError):
+                    orchestrator.run_hermes_review(state)
+                self.assertEqual(state["hermes_review_phase"], "result_ready")
+        with mock.patch.object(orchestrator, "binary", return_value="hermes"), mock.patch.object(orchestrator.subprocess, "run", side_effect=subprocess.TimeoutExpired(["hermes"], 30)), self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.verify_hermes()
+
+    def test_review_binds_preflight_executable_when_path_changes(self):
+        state = orchestrator.new_state("task", "text", False); state["plan"] = "plan"
+        completed = subprocess.CompletedProcess([], 0, "DECISION: PASS\nadvice", "")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"), mock.patch.object(orchestrator, "verify_hermes", return_value=("/trusted/bin/hermes", "/profile")), mock.patch.dict(orchestrator.os.environ, {"PATH": "/attacker/bin"}, clear=True), mock.patch.object(orchestrator, "run_cmd", return_value=completed) as run:
+            orchestrator.run_hermes_review(state)
+        self.assertEqual(run.call_args.args[0][0], "/trusted/bin/hermes")
+        self.assertEqual(run.call_args.kwargs["approved_hermes_executable"], "/trusted/bin/hermes")
+
+    def test_review_timeout_and_launch_failure_are_sanitized_and_counted(self):
+        failures = ((subprocess.TimeoutExpired(["hermes"], 130), "timeout"),
+                    (FileNotFoundError("secret launch detail"), "command_launch_failure"))
+        for exception, expected in failures:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                state = orchestrator.new_state("task", "text", False); state["plan"] = "plan"
+                state_file = Path(directory) / "state.json"
+                with mock.patch.object(orchestrator, "STATE_FILE", state_file), mock.patch.object(orchestrator, "verify_hermes", return_value=("/usr/bin/hermes", "/profile")), mock.patch.object(orchestrator, "run_cmd", side_effect=exception), self.assertRaises(orchestrator.OrchestratorError):
+                    orchestrator.run_hermes_review(state)
+                self.assertEqual(state["hermes_review_count"], 1)
+                self.assertEqual(state["hermes_failure_type"], expected)
+                self.assertNotIn("secret launch detail", state_file.read_text())
+
+    def test_resume_stops_if_replan_call_was_interrupted(self):
+        state = orchestrator.new_state("task", "text", False)
+        state.update({"plan": "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: test", "completed_steps": ["planned"], "hermes_replans": 1, "hermes_replan_pending": True, "hermes_replan_phase": "started", "hermes_review_count": 1, "hermes_reviews": [{"advice": "revise"}]})
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"), mock.patch.object(orchestrator, "REPORT_FILE", Path(directory) / "report.md"), mock.patch.object(orchestrator, "codex_turn") as planner, mock.patch.object(orchestrator, "run_hermes_review") as review, mock.patch.object(orchestrator, "approval") as approval:
+            self.assertEqual(orchestrator.continue_run(state), 0)
+        planner.assert_not_called(); review.assert_not_called(); approval.assert_not_called()
+        self.assertEqual(state["outcome"], "stop_required")
+
+    def test_resume_marks_started_review_ambiguous_without_rerunning_hermes(self):
+        state = orchestrator.new_state("task", "text", False)
+        state.update({"plan": "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: test", "completed_steps": ["planned"], "hermes_review_phase": "started", "hermes_review_count": 1, "hermes_config": orchestrator.hermes_config()})
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            report_file = Path(directory) / "report.md"
+            with mock.patch.object(orchestrator, "STATE_FILE", state_file), mock.patch.object(orchestrator, "REPORT_FILE", report_file), mock.patch.object(orchestrator, "run_hermes_review") as review, mock.patch.object(orchestrator.subprocess, "run") as subprocess_run, mock.patch.object(orchestrator, "approval") as approval, mock.patch.object(orchestrator, "create_worktree") as worktree:
+                self.assertEqual(orchestrator.continue_run(state), 0)
+            report = report_file.read_text()
+        review.assert_not_called()
+        subprocess_run.assert_not_called()
+        approval.assert_not_called()
+        worktree.assert_not_called()
+        self.assertEqual(state["hermes_review_phase"], "ambiguous")
+        self.assertEqual(state["hermes_failure_type"], "interrupted_review")
+        self.assertEqual(state["hermes_review_count"], 1)
+        self.assertIn("수동 확인", report)
+        self.assertIn("interrupted_review", report)
+
+    def test_replan_start_is_durable_before_codex_call_and_completion_is_saved(self):
+        state = orchestrator.new_state("task", "text", False)
+        state.update({"plan": "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: initial", "completed_steps": ["planned"], "hermes_replans": 1, "hermes_replan_pending": True, "hermes_review_count": 1, "hermes_reviews": [{"advice": "revise"}]})
+        revised = "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: revised"
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            def replan(*_args):
+                self.assertEqual(orchestrator.load_json(state_file)["hermes_replan_phase"], "started")
+                return "thread", revised
+            with mock.patch.object(orchestrator, "STATE_FILE", state_file), mock.patch.object(orchestrator, "REPORT_FILE", Path(directory) / "report.md"), mock.patch.object(orchestrator, "codex_turn", side_effect=replan), mock.patch.object(orchestrator, "run_hermes_review", return_value="STOP"), mock.patch.object(orchestrator, "approval"):
+                self.assertEqual(orchestrator.continue_run(state), 0)
+            saved = orchestrator.load_json(state_file)
+        self.assertEqual(saved["hermes_replan_phase"], "completed")
+        self.assertEqual(saved["plan"], revised)
+
+    def test_resume_stops_on_persisted_hermes_error_without_replanning(self):
+        for result in ("ERROR", "FORMAT_ERROR"):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as directory:
+                state = orchestrator.new_state("task", "text", False)
+                state.update({"plan": "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: test", "completed_steps": ["planned"], "hermes_last_decision": result, "hermes_review_phase": "result_ready", "hermes_review_count": 1})
+                with mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"), mock.patch.object(orchestrator, "REPORT_FILE", Path(directory) / "report.md"), mock.patch.object(orchestrator, "codex_turn") as planner, mock.patch.object(orchestrator, "run_hermes_review") as review, mock.patch.object(orchestrator, "approval") as approval:
+                    self.assertEqual(orchestrator.continue_run(state), 0)
+                planner.assert_not_called()
+                review.assert_not_called()
+                approval.assert_not_called()
+                self.assertEqual(state["outcome"], "stop_required")
+                self.assertNotIn("hermes_replan_pending", state)
+
+    def test_resume_consumes_persisted_pass_without_second_hermes_call(self):
+        state = orchestrator.new_state("task", "text", False)
+        state.update({"plan": "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: test", "completed_steps": ["planned"], "hermes_last_decision": "PASS", "hermes_review_phase": "result_ready", "hermes_review_count": 1})
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(orchestrator, "STATE_FILE", Path(directory)/"state.json"), mock.patch.object(orchestrator, "verify_prime_cli", return_value={"version": "test"}), mock.patch.object(orchestrator, "run_hermes_review") as review, mock.patch.object(orchestrator, "approval", return_value=False):
+            self.assertEqual(orchestrator.continue_run(state), 2)
+        review.assert_not_called()
+        self.assertIn("hermes_reviewed", state["completed_steps"])
+
+    def test_second_revise_stops_before_approval(self):
+        initial = "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: initial"; revised = "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: revised"; state = orchestrator.new_state("task", "text", False)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(orchestrator, "STATE_FILE", Path(directory)/"state.json"), mock.patch.object(orchestrator, "REPORT_FILE", Path(directory)/"report.md"), mock.patch.object(orchestrator, "codex_turn", side_effect=[("one", initial), ("two", revised)]), mock.patch.object(orchestrator, "run_hermes_review", side_effect=["REVISE", "REVISE"]) as review, mock.patch.object(orchestrator, "approval") as approval:
+            self.assertEqual(orchestrator.continue_run(state), 0)
+        self.assertEqual(review.call_count, 2); approval.assert_not_called()
+
+    def test_resume_skips_completed_pass_review(self):
+        state = orchestrator.new_state("task", "text", False)
+        state.update({"plan": "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: test", "completed_steps": ["planned", "hermes_reviewed"]})
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(orchestrator, "STATE_FILE", Path(directory)/"state.json"), mock.patch.object(orchestrator, "verify_prime_cli", return_value={"version": "test"}), mock.patch.object(orchestrator, "run_hermes_review") as review, mock.patch.object(orchestrator, "approval", return_value=False):
+            self.assertEqual(orchestrator.continue_run(state), 2)
+        review.assert_not_called()
+
+    def test_revise_replans_once_then_stop_before_approval(self):
+        initial = "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: initial"; revised = "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: revised"; state = orchestrator.new_state("task", "text", False)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(orchestrator, "STATE_FILE", Path(directory)/"state.json"), mock.patch.object(orchestrator, "REPORT_FILE", Path(directory)/"report.md"), mock.patch.object(orchestrator, "codex_turn", side_effect=[("one", initial), ("two", revised)]), mock.patch.object(orchestrator, "run_hermes_review", side_effect=["REVISE", "STOP"]) as review, mock.patch.object(orchestrator, "approval") as approval:
+            self.assertEqual(orchestrator.continue_run(state), 0)
+        self.assertEqual(review.call_count, 2); approval.assert_not_called(); self.assertEqual(state["hermes_replans"], 1)
 
 
 class ExecutionProfileTests(unittest.TestCase):
@@ -173,6 +400,7 @@ class ExecutionProfileTests(unittest.TestCase):
                 mock.patch.object(orchestrator, "codex_turn", return_value=("thread", "DECISION: PROCEED\nTASK_SIZE: HUGE\nTASK_SIZE_REASON: invalid")),
                 mock.patch.object(orchestrator, "approval") as approval,
                 mock.patch.object(orchestrator, "create_worktree") as create_worktree,
+                mock.patch.object(orchestrator, "run_hermes_review", return_value="PASS"),
             ):
                 self.assertEqual(orchestrator.continue_run(state), 0)
         approval.assert_not_called()
@@ -213,6 +441,18 @@ class CommandSafetyTests(unittest.TestCase):
             orchestrator.assert_command_allowed(
                 self.prime_command(prompt), approved_worktree=self.worktree,
             )
+
+    def test_alternate_hermes_executables_argv_and_toolsets_are_blocked(self):
+        trusted = orchestrator.hermes_argv()
+        variants = [
+            ["/tmp/hermes", *trusted[1:]],
+            ["./hermes", *trusted[1:]],
+            [*trusted, "--yolo"],
+            [*trusted[:trusted.index("--toolsets") + 1], "shell", *trusted[trusted.index("--toolsets") + 2:]],
+        ]
+        for command in variants:
+            with self.subTest(command=command), self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator.assert_command_allowed(command)
 
     def test_prime_prompt_git_push_is_data(self):
         self.assert_prime_allowed("Never run git push")
@@ -617,6 +857,7 @@ class PrimeExecutionTests(unittest.TestCase):
                 mock.patch.object(orchestrator, "verify_prime_cli", side_effect=orchestrator.OrchestratorError("unavailable")),
                 mock.patch.object(orchestrator, "approval") as approval,
                 mock.patch.object(orchestrator, "create_worktree") as create_worktree,
+                mock.patch.object(orchestrator, "run_hermes_review", return_value="PASS"),
             ):
                 self.assertEqual(orchestrator.continue_run(state), 0)
             self.assertEqual(state["outcome"], "stop_required")
