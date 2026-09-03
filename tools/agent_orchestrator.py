@@ -648,7 +648,7 @@ def verify_hermes() -> tuple[str, str]:
         try:
             version = subprocess.run([command, "--version"], **kwargs)
             profile = subprocess.run([command, "profile", "show", HERMES_PROFILE], **kwargs)
-            auth = subprocess.run([command, "auth", "status", HERMES_PROVIDER], **kwargs)
+            auth = subprocess.run([command, "-p", HERMES_PROFILE, "auth", "status", HERMES_PROVIDER], **kwargs)
         except (OSError, subprocess.TimeoutExpired) as exc:
             failure_type = "executable_missing" if isinstance(exc, (FileNotFoundError, PermissionError)) else "preflight_unavailable"
             raise HermesPreflightError(failure_type, "Hermes 사전 점검을 실행할 수 없습니다.") from exc
