@@ -83,4 +83,6 @@ For `DECISION: PROCEED`, the planner must provide one exact `TASK_SIZE` (`SMALL`
 | MEDIUM | Yes | 2 | 8 | 40000 | 900 seconds | 2 |
 | LARGE | Yes | 3 | 12 | 80000 | 1800 seconds | 3 |
 
+SMALL 프로필은 단순 문서 수정처럼 범위가 명확하고 위험이 낮은 작업에 사용됩니다.
+
 The autonomous gate is fixed to exactly `git diff --check`. Passing that gate alone does not mean the overall run succeeded: repository checks and a fresh independent Codex review must also pass. The selected profile and budgets are saved in runtime state and the final report.
