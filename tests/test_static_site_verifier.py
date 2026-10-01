@@ -97,6 +97,9 @@ class CheckConfigurationTests(unittest.TestCase):
         state = orchestrator.new_state("test", "text", False)
         with (
             mock.patch.object(orchestrator, "load_config", return_value={"checks": self.configured_checks()}),
+            mock.patch.object(orchestrator, "require_validation", return_value={"checks": self.configured_checks()}),
+            mock.patch.object(orchestrator, "bind_validation_step"),
+            mock.patch.object(orchestrator.os, "environ", {"PATH": "/synthetic/bin"}),
             mock.patch.object(orchestrator, "run_cmd", side_effect=completed) as run_cmd,
             mock.patch.object(orchestrator, "save_state"),
         ):

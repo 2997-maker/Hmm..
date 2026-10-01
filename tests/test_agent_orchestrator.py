@@ -1,7 +1,9 @@
 import argparse
 import contextlib
+import copy
 import importlib.util
 import io
+import os
 import subprocess
 import tempfile
 import unittest
@@ -16,7 +18,50 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(orchestrator)
 
 
-class PlannerDecisionTests(unittest.TestCase):
+def subject_fixture():
+    subject = {"head": "a" * 40, "branch": "agent/issue-5", "index": "c" * 64,
+               "index_tree": "d" * 40, "target": "e" * 64, "tree": "b" * 40,
+               "object_format": "sha1", "checks": {"test": ["synthetic-check"]}}
+    subject["fingerprint"] = orchestrator.digest_json(subject)
+    return subject
+
+
+def bind_fixture(state, steps=None, subject=None):
+    subject = subject or subject_fixture()
+    steps = list(steps) if steps is not None else [step for step in state["completed_steps"] if step in orchestrator.VALIDATION_STEPS]
+    state["validation"] = {"version": orchestrator.VALIDATION_VERSION, "subject": copy.deepcopy(subject),
+                           "steps": {step: subject["fingerprint"] for step in steps}}
+    for step in steps:
+        if step not in state["completed_steps"]:
+            state["completed_steps"].append(step)
+    return subject
+
+
+def passing_checks(state, _cwd, label):
+    orchestrator.bind_validation_step(state, f"checks_{label}")
+    return True
+
+
+def bound_report(state):
+    orchestrator.bind_validation_step(state, "report_written")
+    orchestrator.complete_step(state, "report_written", "synthetic report")
+
+
+class OfflineTestCase(unittest.TestCase):
+    def enterContext(self, manager):
+        value = manager.__enter__()
+        self.addCleanup(manager.__exit__, None, None, None)
+        return value
+
+    def setUp(self):
+        super().setUp()
+        # No test may accidentally launch Git mutations, model/OAuth CLIs, or a service.
+        self.enterContext(mock.patch.object(orchestrator.subprocess, "run", side_effect=AssertionError("unmocked process")))
+        self.enterContext(mock.patch.object(orchestrator.os, "environ", {"PATH": "/synthetic/bin", "LANG": "C.UTF-8"}))
+        self.enterContext(mock.patch.dict("sys.modules", {"openai_codex": mock.Mock(Codex=mock.Mock(side_effect=AssertionError("unmocked model")))}))
+
+
+class PlannerDecisionTests(OfflineTestCase):
     def run_plan(self, response):
         with tempfile.TemporaryDirectory() as directory:
             runtime = Path(directory)
@@ -90,7 +135,7 @@ class PlannerDecisionTests(unittest.TestCase):
             self.run_plan("DECISION: MAYBE\n변경 계획입니다")
 
 
-class HermesAdvisorTests(unittest.TestCase):
+class HermesAdvisorTests(OfflineTestCase):
     def test_query_contains_trusted_context_and_fixed_decision_criteria(self):
         state = {"task": "small task", "plan": "change one file and run tests"}
         query = orchestrator.hermes_query(state)
@@ -380,8 +425,9 @@ class HermesAdvisorTests(unittest.TestCase):
         self.assertEqual(review.call_count, 2); approval.assert_not_called(); self.assertEqual(state["hermes_replans"], 1)
 
 
-class ExecutionProfileTests(unittest.TestCase):
+class ExecutionProfileTests(OfflineTestCase):
     def setUp(self):
+        super().setUp()
         self.worktree = Path("/tmp/agent-test-worktree")
         self.session = orchestrator.RUNTIME_DIR / "prime-sessions" / "test-run"
         self.prompt = "implement trusted plan"
@@ -474,18 +520,21 @@ class ExecutionProfileTests(unittest.TestCase):
     def test_final_report_records_profile(self):
         state = orchestrator.new_state("task", "text", False)
         state.update({"status": "complete", "worktree": str(self.worktree), "execution_profile": orchestrator.execution_profile("MEDIUM")})
+        subject = bind_fixture(state, orchestrator.VALIDATION_STEPS[:3])
         with (
             tempfile.TemporaryDirectory() as directory,
             mock.patch.object(orchestrator, "REPORT_FILE", Path(directory) / "report.md"),
             mock.patch.object(orchestrator, "run_cmd", return_value=mock.Mock(stdout="")),
+            mock.patch.object(orchestrator, "validation_snapshot", return_value=subject),
             mock.patch.object(orchestrator, "complete_step"),
         ):
             orchestrator.final_report(state)
             self.assertIn('"task_size": "MEDIUM"', (Path(directory) / "report.md").read_text())
 
 
-class CommandSafetyTests(unittest.TestCase):
+class CommandSafetyTests(OfflineTestCase):
     def setUp(self):
+        super().setUp()
         self.worktree = Path("/tmp/agent-test-worktree")
         self.session = orchestrator.RUNTIME_DIR / "prime-sessions" / "test-run"
         self.prime = "/opt/prime/bin/prime-agent"
@@ -587,7 +636,7 @@ class CommandSafetyTests(unittest.TestCase):
             )
 
 
-class BranchPolicyTests(unittest.TestCase):
+class BranchPolicyTests(OfflineTestCase):
     def doctor_rows_for(self, branch, gh_returncode=0):
         completed = mock.Mock(returncode=gh_returncode)
         with (
@@ -654,7 +703,13 @@ class BranchPolicyTests(unittest.TestCase):
         self.assertIn("GitHub 인증 실패는 --issue 실행을 막지만", output.getvalue())
 
 
-class ExternalApprovalTests(unittest.TestCase):
+class ExternalApprovalTests(OfflineTestCase):
+    def setUp(self):
+        super().setUp()
+        # These existing tests exercise external-action policy. Binding itself is tested below.
+        self.enterContext(mock.patch.object(orchestrator, "require_validation", return_value=subject_fixture()))
+        self.enterContext(mock.patch.object(orchestrator, "verify_prime_cli", return_value={"version": "synthetic"}))
+
     def external_state(self):
         state = orchestrator.new_state("test", "text", False)
         state.update({
@@ -662,6 +717,7 @@ class ExternalApprovalTests(unittest.TestCase):
             "worktree_owned": True, "pushed": False, "commit": "abc123",
             "completed_steps": ["external_approval"],
         })
+        bind_fixture(state, orchestrator.VALIDATION_STEPS)
         return state
 
     def test_push_requires_external_approval(self):
@@ -848,7 +904,7 @@ class ExternalApprovalTests(unittest.TestCase):
             self.assertEqual(saved["draft_pr"], pr)
 
 
-class PrimeExecutionTests(unittest.TestCase):
+class PrimeExecutionTests(OfflineTestCase):
     def test_each_profile_adds_exact_trusted_implementation_instruction(self):
         expected = {
             "SMALL": "Handle the task directly and do not use recursive subagents.",
@@ -947,7 +1003,7 @@ class PrimeExecutionTests(unittest.TestCase):
             orchestrator.verify_prime_cli(profile)
 
 
-class ReviewRetryTests(unittest.TestCase):
+class ReviewRetryTests(OfflineTestCase):
     def stale_fix_state(self):
         state = orchestrator.new_state("task", "text", False)
         state.update({
@@ -963,8 +1019,9 @@ class ReviewRetryTests(unittest.TestCase):
         })
         return state
 
-    def test_resume_invalidates_stale_fix_then_reviews_checks_and_reports_again(self):
+    def test_legacy_fix_without_fingerprint_stops_and_preserves_records(self):
         state = self.stale_fix_state()
+        original = copy.deepcopy(state)
         with (
             tempfile.TemporaryDirectory() as directory,
             mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"),
@@ -974,13 +1031,14 @@ class ReviewRetryTests(unittest.TestCase):
             mock.patch.object(orchestrator, "run_checks", return_value=True) as checks,
             mock.patch.object(orchestrator, "final_report", side_effect=lambda current: orchestrator.complete_step(current, "report_written", "new report")) as report,
             mock.patch.object(orchestrator, "approval", return_value=False),
+            self.assertRaises(orchestrator.OrchestratorError),
         ):
-            self.assertEqual(orchestrator.continue_run(state), 2)
-        reviewer.assert_called_once()
-        checks.assert_called_once_with(state, Path(state["worktree"]), "final")
-        report.assert_called_once_with(state)
-        self.assertEqual(state["review"], "VERDICT: PASS\nfresh")
-        self.assertNotIn("old", state["checks"].get("final", {}))
+            orchestrator.continue_run(state)
+        reviewer.assert_not_called()
+        checks.assert_not_called()
+        report.assert_not_called()
+        for key in ("checks", "review", "report", "completed_steps", "fix_attempts"):
+            self.assertEqual(state[key], original[key])
 
     def test_stale_fix_after_external_progress_stops_without_new_review(self):
         for marker in ("external_approval", "commit_created", "branch_pushed", "draft_pr_created"):
@@ -1009,21 +1067,570 @@ class ReviewRetryTests(unittest.TestCase):
                     "execution_profile": orchestrator.execution_profile(size),
                     "completed_steps": ["planned", "plan_approved", "worktree_created", "prime_implemented", "checks_initial"],
                 })
+                subject = bind_fixture(state)
                 reviews = [("review", "VERDICT: FIX")] * limit + [("review", "VERDICT: PASS")]
                 with (
                     mock.patch.object(orchestrator, "STATE_FILE", Path(directory) / "state.json"),
                     mock.patch.object(orchestrator, "verify_prime_cli", return_value={"version": "test"}),
                     mock.patch.object(orchestrator, "codex_turn", side_effect=reviews) as reviewer,
                     mock.patch.object(orchestrator, "review_snapshot", return_value="diff"),
+                    mock.patch.object(orchestrator, "validation_snapshot", return_value=subject),
                     mock.patch.object(orchestrator, "run_prime") as run_prime,
-                    mock.patch.object(orchestrator, "run_checks", return_value=True),
-                    mock.patch.object(orchestrator, "final_report", side_effect=lambda current: orchestrator.complete_step(current, "report_written", "report")),
+                    mock.patch.object(orchestrator, "run_checks", side_effect=passing_checks),
+                    mock.patch.object(orchestrator, "final_report", side_effect=bound_report),
                     mock.patch.object(orchestrator, "approval", return_value=False),
                 ):
                     self.assertEqual(orchestrator.continue_run(state), 2)
                 self.assertEqual(run_prime.call_count, limit)
                 self.assertEqual(reviewer.call_count, limit + 1)
                 self.assertEqual(state["fix_attempts"], limit)
+
+
+class SyntheticRepository:
+    """Real temporary files, synthetic Git metadata; never runs a Git command."""
+    def __init__(self, root):
+        self.root = root
+        self.head = "a" * 40
+        self.branch = "agent/issue-5"
+        self.index = {"script.js": ("100644", orchestrator.git_object_id("blob", b"baseline", "sha1"))}
+        self.commits = {}
+        self.commands = []
+        self.on_check = lambda: None
+        self.on_add = lambda: None
+        self.on_commit = lambda: None
+        self.check_returncode = 0
+        (root / "script.js").write_bytes(b"before")
+
+    def paths(self):
+        paths = set(self.index)
+        for directory, dirs, files in os.walk(self.root, followlinks=False):
+            for name in [*files, *(name for name in dirs if (Path(directory) / name).is_symlink())]:
+                paths.add((Path(directory) / name).relative_to(self.root).as_posix())
+        return sorted(paths)
+
+    def index_tree(self):
+        return orchestrator.candidate_tree([
+            {"path": path, "mode": mode, "blob": oid} for path, (mode, oid) in self.index.items()
+        ], "sha1")
+
+    def run(self, argv, **kwargs):
+        self.commands.append((list(argv), kwargs))
+        stdout = ""
+        if argv == ["synthetic-check"]:
+            self.on_check()
+            return subprocess.CompletedProcess(argv, self.check_returncode, "", "")
+        if argv == ["git", "rev-parse", "HEAD"]:
+            stdout = self.head
+        elif argv == ["git", "rev-parse", "--show-object-format"]:
+            stdout = "sha1"
+        elif argv == ["git", "branch", "--show-current"]:
+            stdout = self.branch
+        elif argv == ["git", "ls-files", "--stage", "-z"]:
+            stdout = "".join(f"{mode} {oid} 0\t{path}\0" for path, (mode, oid) in sorted(self.index.items()))
+        elif argv[:2] == ["git", "ls-files"]:
+            paths = self.paths() if "--cached" in argv else [path for path in self.paths() if path not in self.index]
+            stdout = "".join(f"{path}\0" for path in paths)
+        elif argv[:2] == ["git", "diff"]:
+            stdout = "synthetic staged diff" if "--cached" in argv else "synthetic unstaged diff"
+        elif argv[:2] == ["git", "status"]:
+            stdout = "" if self.head in self.commits else " M script.js\n"
+        elif argv == ["git", "add", "--all"]:
+            self.on_add()
+            new_index = {}
+            for path in self.paths():
+                mode, raw = orchestrator.read_repo_entry(self.root, path)
+                if mode != "missing":
+                    new_index[path] = mode, orchestrator.git_object_id("blob", raw, "sha1")
+            self.index = new_index
+        elif argv == ["git", "write-tree"]:
+            stdout = self.index_tree()
+        elif argv[:2] == ["git", "commit-tree"]:
+            self.on_commit()
+            stdout = "f" * 40
+            self.commits[stdout] = argv[2], argv[4]
+        elif argv[:3] == ["git", "update-ref", "--no-deref"]:
+            if argv[3] != f"refs/heads/{self.branch}" or argv[5] != self.head:
+                raise orchestrator.OrchestratorError("synthetic compare-and-swap failed")
+            self.head = argv[4]
+        elif argv[:4] == ["git", "show", "-s", "--format=%T %P"]:
+            stdout = " ".join(self.commits[argv[4]])
+        elif argv == ["git", "remote", "get-url", "origin"]:
+            stdout = "https://example.test/repo"
+        else:
+            raise AssertionError(f"unexpected synthetic command: {argv}")
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+
+class ValidationTestCase(OfflineTestCase):
+    def setUp(self):
+        super().setUp()
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.runtime = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.repo = SyntheticRepository(self.root)
+        self.state = orchestrator.new_state("synthetic task", "text", False)
+        self.state.update({"worktree": str(self.root), "worktree_owned": True, "branch": self.repo.branch,
+                           "plan": "DECISION: PROCEED\nTASK_SIZE: SMALL\nTASK_SIZE_REASON: synthetic",
+                           "completed_steps": ["planned", "plan_approved", "worktree_created", "prime_implemented"]})
+        self.enterContext(mock.patch.object(orchestrator, "STATE_FILE", self.runtime / "state.json"))
+        self.enterContext(mock.patch.object(orchestrator, "REPORT_FILE", self.runtime / "report.md"))
+        self.enterContext(mock.patch.object(orchestrator, "run_cmd", side_effect=self.repo.run))
+        self.enterContext(mock.patch.object(orchestrator, "load_config", return_value={"checks": {"test": ["synthetic-check"]}}))
+        self.preflight = self.enterContext(mock.patch.object(orchestrator, "verify_prime_cli", return_value={"version": "synthetic"}))
+        self.reviewer = self.enterContext(mock.patch.object(orchestrator, "codex_turn", return_value=("reviewer", "VERDICT: PASS")))
+        self.prime = self.enterContext(mock.patch.object(orchestrator, "run_prime", side_effect=AssertionError("unexpected Prime call")))
+        self.approval = self.enterContext(mock.patch.object(orchestrator, "approval", return_value=False))
+        self.push = self.enterContext(mock.patch.object(orchestrator, "approved_feature_push"))
+        self.pr = self.enterContext(mock.patch.object(orchestrator, "existing_draft_pr", return_value={"url": "https://example.test/pr"}))
+
+    def snapshot(self):
+        return orchestrator.validation_snapshot(self.state, self.root)
+
+    def to_approval(self):
+        self.assertEqual(orchestrator.continue_run(self.state), 2)
+        self.assertEqual(self.state["status"], "awaiting_external_approval")
+
+    def mutations(self):
+        return [argv for argv, _kwargs in self.repo.commands if argv[:2] in (
+            ["git", "add"], ["git", "commit-tree"], ["git", "update-ref"])]
+
+
+class FingerprintTests(ValidationTestCase):
+    def test_same_content_with_different_mtime_has_same_fingerprint(self):
+        before = self.snapshot()
+        os.utime(self.root / "script.js", (1, 1))
+        self.assertEqual(before, self.snapshot())
+
+    def test_same_size_and_mtime_content_change_is_detected(self):
+        path = self.root / "script.js"
+        before, metadata = self.snapshot(), path.stat()
+        path.write_bytes(b"after!")
+        os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+        self.assertNotEqual(before["fingerprint"], self.snapshot()["fingerprint"])
+
+    def test_untracked_binary_tail_beyond_preview_limit_is_hashed(self):
+        path = self.root / "space and\nnewline.bin"
+        path.write_bytes(b"\0" * 250_000 + b"a")
+        before = self.snapshot()
+        path.write_bytes(b"\0" * 250_000 + b"b")
+        self.assertNotEqual(before["target"], self.snapshot()["target"])
+        path.unlink()
+        self.assertNotEqual(before["tree"], self.snapshot()["tree"])
+
+    def test_tracked_deletion_and_executable_mode_are_detected(self):
+        before = self.snapshot()
+        (self.root / "script.js").chmod(0o755)
+        self.assertNotEqual(before["tree"], self.snapshot()["tree"])
+        (self.root / "script.js").unlink()
+        self.assertNotEqual(before["fingerprint"], self.snapshot()["fingerprint"])
+
+    def test_deleted_parent_directory_is_a_deletion(self):
+        self.repo.index["gone/child.txt"] = "100644", "0" * 40
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot["tree"], orchestrator.candidate_tree([
+            {"path": "script.js", "mode": "100644", "blob": orchestrator.git_object_id("blob", b"before", "sha1")}
+        ], "sha1"))
+
+    def test_staged_only_and_head_changes_invalidate_source(self):
+        before = self.snapshot()
+        self.repo.index["script.js"] = "100644", "1" * 40
+        staged = self.snapshot()
+        self.assertNotEqual(before["fingerprint"], staged["fingerprint"])
+        self.repo.head = "2" * 40
+        self.assertNotEqual(staged["fingerprint"], self.snapshot()["fingerprint"])
+
+    def test_external_symlink_hashes_only_link_text(self):
+        outside = self.runtime / "synthetic-secret.txt"
+        outside.write_bytes(b"synthetic outside value A")
+        link = self.root / "link"
+        link.symlink_to(outside)
+        before = self.snapshot()
+        self.assertEqual(orchestrator.read_repo_entry(self.root, "link"), ("120000", os.fsencode(outside)))
+        outside.write_bytes(b"synthetic outside value B")
+        self.assertEqual(before, self.snapshot())
+        outside.unlink()
+        self.assertEqual(before, self.snapshot())
+        link.unlink()
+        link.symlink_to("different-target")
+        self.assertNotEqual(before["fingerprint"], self.snapshot()["fingerprint"])
+
+    def test_symlink_parent_and_package_json_are_not_followed(self):
+        (self.runtime / "synthetic.json").write_text('{"scripts":{"test":"do-not-read"}}')
+        (self.root / "linked-dir").symlink_to(self.runtime, target_is_directory=True)
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.read_repo_entry(self.root, "linked-dir/synthetic.json")
+        (self.root / "package.json").symlink_to(self.runtime / "synthetic.json")
+        with self.assertRaises(orchestrator.OrchestratorError):
+            self.snapshot()
+
+    def test_read_rejects_escape_and_special_files(self):
+        for path in ("../synthetic-secret", "/synthetic-secret", ".git/config"):
+            with self.subTest(path=path), self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator.read_repo_entry(self.root, path)
+        os.mkfifo(self.root / "pipe")
+        with self.assertRaises(orchestrator.OrchestratorError):
+            self.snapshot()
+
+    def test_command_and_approved_plan_changes_are_inputs(self):
+        before = self.snapshot()
+        with mock.patch.object(orchestrator, "discover_checks", return_value={"test": ["different-check"]}):
+            self.assertNotEqual(before["target"], self.snapshot()["target"])
+        self.state["plan"] += "\nchanged scope"
+        self.assertNotEqual(before["target"], self.snapshot()["target"])
+
+    def test_git_tree_hash_matches_known_empty_tree(self):
+        self.assertEqual(orchestrator.candidate_tree([], "sha1"), "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+
+    def test_review_snapshot_includes_staged_changes_and_link_text(self):
+        (self.root / "link").symlink_to(self.runtime / "nonexistent-synthetic-target")
+        text = orchestrator.review_snapshot(self.root)
+        self.assertIn("synthetic staged diff", text)
+        self.assertIn("UNTRACKED SYMLINK", text)
+        self.assertIn("nonexistent-synthetic-target", text)
+
+
+class ValidationFlowTests(ValidationTestCase):
+    def test_all_steps_share_subject_and_unchanged_resume_skips_checks_and_review(self):
+        self.to_approval()
+        before = copy.deepcopy(self.state["validation"])
+        check_count = sum(argv == ["synthetic-check"] for argv, _ in self.repo.commands)
+        self.to_approval()
+        self.assertEqual(self.state["validation"], before)
+        self.assertEqual(self.reviewer.call_count, 1)
+        self.assertEqual(check_count, 2)
+        self.assertEqual(sum(argv == ["synthetic-check"] for argv, _ in self.repo.commands), 2)
+        self.assertEqual(set(before["steps"].values()), {before["subject"]["fingerprint"]})
+
+    def test_changed_resume_stops_before_cli_review_approval_or_commit(self):
+        self.to_approval()
+        self.preflight.reset_mock(); self.reviewer.reset_mock(); self.approval.reset_mock()
+        original = copy.deepcopy(self.state)
+        (self.root / "script.js").write_bytes(b"changed")
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.preflight.assert_not_called(); self.reviewer.assert_not_called(); self.approval.assert_not_called()
+        self.assertEqual(self.mutations(), [])
+        for key in ("validation", "completed_steps", "fix_attempts", "checks", "review", "report"):
+            self.assertEqual(self.state[key], original[key])
+
+    def test_missing_and_malformed_fingerprint_fail_without_retroactive_binding(self):
+        self.to_approval()
+        saved = copy.deepcopy(self.state)
+        for corruption in ("missing", "bad-version", "bad-hash", "missing-stage"):
+            self.state = copy.deepcopy(saved)
+            if corruption == "missing":
+                self.state.pop("validation")
+            elif corruption == "bad-version":
+                self.state["validation"]["version"] = 0
+            elif corruption == "bad-hash":
+                self.state["validation"]["subject"]["fingerprint"] = "invalid"
+            else:
+                self.state["validation"]["steps"].pop("checks_final")
+            with self.subTest(corruption=corruption), self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator.continue_run(self.state)
+        self.assertEqual(self.mutations(), [])
+
+    def test_change_between_initial_and_reviewer_is_rejected(self):
+        real_complete = orchestrator.complete_step
+        def complete(state, step, message):
+            real_complete(state, step, message)
+            if step == "checks_initial":
+                (self.root / "script.js").write_bytes(b"between stages")
+        with mock.patch.object(orchestrator, "complete_step", side_effect=complete), self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.reviewer.assert_not_called()
+
+    def test_check_mutation_even_with_zero_exit_is_rejected(self):
+        self.repo.on_check = lambda: (self.root / "script.js").write_bytes(b"check changed file")
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.assertNotIn("checks_initial", self.state["completed_steps"])
+        self.reviewer.assert_not_called()
+
+    def test_reviewer_mutation_is_not_saved_as_pass(self):
+        def reviewer(*args):
+            (self.root / "script.js").write_bytes(b"reviewer changed file")
+            return "review", "VERDICT: PASS"
+        self.reviewer.side_effect = reviewer
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.assertNotIn("reviewed", self.state["completed_steps"])
+
+    def test_change_between_reviewer_and_final_is_rejected(self):
+        real_save = orchestrator.save_state
+        def save(state, stage=None, message=None):
+            real_save(state, stage, message)
+            if stage == "review_passed":
+                (self.root / "script.js").write_bytes(b"after review")
+        with mock.patch.object(orchestrator, "save_state", side_effect=save), self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.assertNotIn("checks_final", self.state["completed_steps"])
+
+    def test_change_between_final_and_report_is_rejected(self):
+        real_complete = orchestrator.complete_step
+        def complete(state, step, message):
+            real_complete(state, step, message)
+            if step == "checks_final":
+                (self.root / "script.js").write_bytes(b"after final")
+        with mock.patch.object(orchestrator, "complete_step", side_effect=complete), self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.assertNotIn("report_written", self.state["completed_steps"])
+        self.approval.assert_not_called()
+
+    def test_change_between_report_and_approval_is_rejected(self):
+        real_complete = orchestrator.complete_step
+        def complete(state, step, message):
+            real_complete(state, step, message)
+            if step == "report_written":
+                (self.root / "script.js").write_bytes(b"after report")
+        with mock.patch.object(orchestrator, "complete_step", side_effect=complete), self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.approval.assert_not_called()
+
+    def test_stage_fingerprint_from_another_subject_is_rejected(self):
+        self.to_approval()
+        self.state["validation"]["steps"]["checks_initial"] = "0" * 64
+        self.approval.reset_mock()
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.approval.assert_not_called()
+        self.assertEqual(self.mutations(), [])
+
+    def test_final_check_mutation_is_rejected(self):
+        calls = 0
+        def check():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                (self.root / "script.js").write_bytes(b"final changed file")
+        self.repo.on_check = check
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.assertNotIn("checks_final", self.state["completed_steps"])
+
+    def test_approval_wait_mutation_is_rejected(self):
+        self.to_approval()
+        def approval(*args):
+            (self.root / "script.js").write_bytes(b"during approval")
+            return True
+        self.approval.side_effect = approval
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.assertNotIn("external_approval", self.state["completed_steps"])
+        self.assertEqual(self.mutations(), [])
+
+    def test_saved_approval_does_not_authorize_changed_content(self):
+        self.to_approval()
+        orchestrator.bind_validation_step(self.state, "external_approval")
+        orchestrator.complete_step(self.state, "external_approval", "synthetic approval")
+        (self.root / "script.js").write_bytes(b"after saved approval")
+        self.approval.reset_mock()
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.approval.assert_not_called()
+        self.assertEqual(self.mutations(), [])
+
+    def test_failed_check_keeps_failure_and_retries_only_same_target(self):
+        self.repo.check_returncode = 1
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.assertEqual(self.state["checks"]["initial"]["test"]["status"], "FAIL")
+        self.assertNotIn("checks_initial", self.state["completed_steps"])
+        self.repo.check_returncode = 0
+        self.to_approval()
+
+    def test_fix_archives_all_dependent_records_before_mutation_and_keeps_budget(self):
+        self.reviewer.side_effect = [("r1", "VERDICT: FIX"), ("r2", "VERDICT: PASS")]
+        def correction(state, text):
+            persisted = orchestrator.load_json(self.runtime / "state.json")
+            self.assertEqual(persisted["fix_attempts"], 1)
+            self.assertNotIn("validation", persisted)
+            self.assertFalse(set(orchestrator.VALIDATION_STEPS) & set(persisted["completed_steps"]))
+            self.assertIn("plan_approved", persisted["completed_steps"])
+            self.assertEqual(persisted["validation_history"][0]["records"]["review"], "VERDICT: FIX")
+            (self.root / "script.js").write_bytes(b"corrected")
+        self.prime.side_effect = correction
+        self.to_approval()
+        self.assertEqual(self.state["fix_attempts"], 1)
+        self.assertEqual(sum(argv == ["synthetic-check"] for argv, _ in self.repo.commands), 3)
+        self.assertNotEqual(self.state["validation_history"][0]["records"]["validation"]["subject"]["target"],
+                            self.state["validation"]["subject"]["target"])
+
+    def test_interrupted_fix_resumes_without_resetting_attempt_count(self):
+        self.reviewer.side_effect = [("r1", "VERDICT: FIX"), ("r2", "VERDICT: PASS")]
+        self.prime.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            orchestrator.continue_run(self.state)
+        self.state = orchestrator.load_json(self.runtime / "state.json")
+        (self.root / "script.js").write_bytes(b"partial correction")
+        self.to_approval()
+        self.assertEqual(self.state["fix_attempts"], 1)
+        self.assertEqual(self.prime.call_count, 1)
+
+    def test_invalidation_archives_report_and_final_approval_without_refunding_attempts(self):
+        self.to_approval()
+        orchestrator.bind_validation_step(self.state, "external_approval")
+        orchestrator.complete_step(self.state, "external_approval", "synthetic approval")
+        self.state["fix_attempts"] = 2
+        original = copy.deepcopy(self.state)
+        orchestrator.invalidate_for_correction(self.state)
+        history = self.state["validation_history"][-1]
+        self.assertIn("external_approval", history["completed_steps"])
+        self.assertEqual(history["records"]["report"], original["report"])
+        self.assertEqual(history["records"]["checks"], original["checks"])
+        self.assertEqual(history["records"]["validation"], original["validation"])
+        self.assertEqual(self.state["fix_attempts"], 2)
+        self.assertEqual(self.state["events"][:-1], original["events"])
+        self.assertTrue(Path(original["report"]).exists())
+
+
+class ValidatedCommitTests(ValidationTestCase):
+    def test_only_verified_tree_is_committed_and_matching_post_commit_resume_works(self):
+        self.to_approval()
+        subject = copy.deepcopy(self.state["validation"]["subject"])
+        self.approval.return_value = True
+        self.assertEqual(orchestrator.continue_run(self.state), 0)
+        commit_call = next((argv, kwargs) for argv, kwargs in self.repo.commands if argv[:2] == ["git", "commit-tree"])
+        self.assertEqual(commit_call[0], ["git", "commit-tree", subject["tree"], "-p", subject["head"], "-F", "-"])
+        self.assertEqual(commit_call[1]["input_text"], "agent: text\n")
+        self.assertIn(["git", "update-ref", "--no-deref", f"refs/heads/{self.repo.branch}", "f" * 40, subject["head"]], self.mutations())
+        self.assertFalse(any(argv[:2] == ["git", "commit"] for argv, _ in self.repo.commands))
+        self.assertEqual(set(self.state["validation"]["steps"].values()), {subject["fingerprint"]})
+        before = list(self.mutations())
+        self.state["status"] = "failed"
+        self.assertEqual(orchestrator.continue_run(self.state), 0)
+        self.assertEqual(self.mutations(), before)
+
+    def test_symbolic_feature_ref_replacement_after_last_head_read_cannot_update_main(self):
+        self.to_approval()
+        self.approval.return_value = True
+        parent = self.state["validation"]["subject"]["head"]
+        feature = f"refs/heads/{self.repo.branch}"
+        main = "refs/heads/main"
+        refs = {feature: parent, main: parent}
+        updated_refs = []
+        real_run = self.repo.run
+
+        def raced_run(argv, **kwargs):
+            if argv[:2] != ["git", "update-ref"]:
+                return real_run(argv, **kwargs)
+            self.assertEqual(self.repo.commands[-1][0], ["git", "rev-parse", "HEAD"])
+            self.assertEqual(self.repo.head, parent)
+            # A concurrent writer replaces the feature ref immediately after the final HEAD read.
+            refs[feature] = f"ref: {main}"
+            self.repo.commands.append((list(argv), kwargs))
+            no_deref = argv[2] == "--no-deref"
+            ref, new, old = argv[3:] if no_deref else argv[2:]
+            resolved = refs[ref][5:] if refs[ref].startswith("ref: ") else ref
+            if refs[resolved] != old:
+                raise orchestrator.OrchestratorError("synthetic compare-and-swap failed")
+            # Model both Git behaviors so removing --no-deref would advance synthetic main.
+            target = ref if no_deref else resolved
+            refs[target] = new
+            updated_refs.append(target)
+            self.repo.head = refs[main] if refs[feature].startswith("ref: ") else refs[feature]
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(orchestrator, "run_cmd", side_effect=raced_run):
+            self.assertEqual(orchestrator.continue_run(self.state), 0)
+        self.assertEqual(refs[main], parent)
+        self.assertEqual(refs[feature], self.state["commit"])
+        self.assertEqual(updated_refs, [feature])
+
+    def test_staging_mutation_never_reaches_commit_tree(self):
+        self.to_approval()
+        self.approval.return_value = True
+        self.repo.on_add = lambda: (self.root / "script.js").write_bytes(b"changed during add")
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.assertEqual(self.mutations(), [["git", "add", "--all"]])
+
+    def test_index_change_inside_commit_command_cannot_change_immutable_tree_argument(self):
+        self.to_approval()
+        expected = self.state["validation"]["subject"]["tree"]
+        self.approval.return_value = True
+        self.repo.on_commit = lambda: self.repo.index.update({"script.js": ("100644", "9" * 40)})
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.continue_run(self.state)
+        self.assertEqual(self.repo.commits["f" * 40][0], expected)
+        self.assertFalse(any(argv[:2] == ["git", "update-ref"] for argv in self.mutations()))
+
+    def test_prepared_commit_resume_reuses_object_after_interrupted_ref_update(self):
+        self.to_approval()
+        self.approval.return_value = True
+        real_run = self.repo.run
+        def interrupted(argv, **kwargs):
+            if argv[:2] == ["git", "update-ref"]:
+                raise KeyboardInterrupt
+            return real_run(argv, **kwargs)
+        with mock.patch.object(orchestrator, "run_cmd", side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
+            orchestrator.continue_run(self.state)
+        self.state = orchestrator.load_json(self.runtime / "state.json")
+        self.approval.reset_mock()
+        self.assertEqual(orchestrator.continue_run(self.state), 0)
+        self.approval.assert_not_called()
+        self.assertEqual(sum(argv[:2] == ["git", "commit-tree"] for argv in self.mutations()), 1)
+
+    def test_resume_after_ref_update_before_completion_does_not_repeat_commit_or_update(self):
+        self.to_approval()
+        self.approval.return_value = True
+        real_run = self.repo.run
+        def interrupted(argv, **kwargs):
+            result = real_run(argv, **kwargs)
+            if argv[:2] == ["git", "update-ref"]:
+                raise KeyboardInterrupt
+            return result
+        with mock.patch.object(orchestrator, "run_cmd", side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
+            orchestrator.continue_run(self.state)
+        self.state = orchestrator.load_json(self.runtime / "state.json")
+        before = list(self.mutations())
+        self.assertEqual(orchestrator.continue_run(self.state), 0)
+        self.assertEqual(self.mutations(), before)
+
+    def test_unapproved_commit_helper_cannot_stage_or_commit(self):
+        self.to_approval()
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.create_validated_commit(self.state, self.root)
+        self.assertEqual(self.mutations(), [])
+
+    def test_commit_tree_parent_or_head_mismatch_is_rejected(self):
+        self.to_approval()
+        self.approval.return_value = True
+        self.assertEqual(orchestrator.continue_run(self.state), 0)
+        self.repo.commits[self.state["commit"]] = "0" * 40, "0" * 40
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.guard_validation_resume(self.state)
+
+
+class CheckEnvironmentTests(OfflineTestCase):
+    def test_both_check_sets_use_explicit_sanitized_env_and_preserve_parent(self):
+        names = ["GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+                 "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN", "CF_API_KEY", "CLOUDFLARE_ACCOUNT_ID",
+                 "gh_enterprise_token", "cLoUdFlArE_api_key", "CF_ACCOUNT_ID"]
+        parent = {name: f"synthetic-{i:08d}" for i, name in enumerate(names)}
+        parent.update({"PATH": "/synthetic/bin", "LANG": "C.UTF-8"})
+        for label in ("initial", "final"):
+            state = orchestrator.new_state("task", "text", False)
+            subject = subject_fixture()
+            subject["checks"] = {"lint": ["node", "--check", "script.js"], "test": ["python", "-m", "unittest"],
+                                 "build": ["python", "tools/verify_static_site.py"], "typecheck": None}
+            subject["fingerprint"] = orchestrator.digest_json({k: v for k, v in subject.items() if k != "fingerprint"})
+            process = subprocess.CompletedProcess([], 0, parent["GH_TOKEN"], parent["CF_API_KEY"])
+            with (
+                mock.patch.object(orchestrator.os, "environ", parent),
+                mock.patch.object(orchestrator, "validation_snapshot", return_value=subject),
+                mock.patch.object(orchestrator, "save_state"),
+                mock.patch.object(orchestrator.subprocess, "run", return_value=process) as run,
+            ):
+                before = dict(parent)
+                self.assertTrue(orchestrator.run_checks(state, Path("/synthetic/worktree"), label))
+                self.assertEqual(parent, before)
+            self.assertEqual(run.call_count, 3)
+            for call in run.call_args_list:
+                self.assertEqual(call.kwargs["env"], {"PATH": "/synthetic/bin", "LANG": "C.UTF-8"})
+                self.assertIsNot(call.kwargs["env"], parent)
+            self.assertEqual(state["checks"][label]["typecheck"]["status"], "SKIPPED")
+            self.assertNotIn(parent["GH_TOKEN"], str(state))
+            self.assertNotIn(parent["CF_API_KEY"], str(state))
 
 
 if __name__ == "__main__":

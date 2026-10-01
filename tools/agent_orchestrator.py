@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
+import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,6 +31,12 @@ SENSITIVE_ENV_NAMES = {
     "GITHUB_TOKEN", "GH_TOKEN", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
     "CF_API_TOKEN", "CF_API_KEY", "CF_ACCOUNT_ID",
 }
+VALIDATION_VERSION = 1
+VALIDATION_STEPS = ("checks_initial", "reviewed", "checks_final", "report_written", "external_approval")
+VALIDATION_RECOVERY = (
+    "변경사항, state.json, 보고서와 worktree를 보존하세요. 지문/승인/재시도 기록을 편집하거나 "
+    "cleanup하지 말고 docs/agent-orchestrator.md의 검증 중단 수동 복구 절차를 따르세요."
+)
 HERMES_PROFILE = "orchestrator-advisor"
 HERMES_PROVIDER = "openai-codex"
 HERMES_MODEL = "gpt-5.6-sol"
@@ -314,6 +323,8 @@ def assert_approved_external_state(state: dict[str, Any], worktree: Path) -> str
     head = run_cmd(["git", "rev-parse", "HEAD"], cwd=worktree).stdout.strip()
     if not isinstance(commit, str) or not commit or head != commit:
         raise OrchestratorError("현재 HEAD가 실행 상태에 저장된 commit과 다릅니다.")
+    require_validation_steps(state, VALIDATION_STEPS)
+    require_validation(state, worktree)
     if not run_cmd(["git", "remote", "get-url", "origin"], cwd=worktree).stdout.strip():
         raise OrchestratorError("origin remote가 구성되어 있지 않습니다.")
     return branch
@@ -856,12 +867,285 @@ def create_worktree(state: dict[str, Any]) -> None:
     complete_step(state, "worktree_created", f"전용 branch/worktree 생성: {branch} / {path}")
 
 
+def digest_json(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def read_repo_entry(cwd: Path, relative: str) -> tuple[str, bytes]:
+    """Read a regular file or link text, never traversing a symlink (including parents)."""
+    parts = relative.split("/")
+    if not relative or any(part in {"", ".", "..", ".git"} for part in parts) or relative.startswith("/"):
+        raise OrchestratorError("검증 대상 경로가 올바르지 않습니다.")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        # Open every component through directory fds: lstat-then-open alone has a link race.
+        for part in cwd.absolute().parts[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        for part in parts[:-1]:
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                return "missing", b""
+            os.close(fd)
+            fd = child
+        try:
+            info = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return "missing", b""
+        if stat.S_ISLNK(info.st_mode):
+            return "120000", os.fsencode(os.readlink(parts[-1], dir_fd=fd))
+        if not stat.S_ISREG(info.st_mode):
+            raise OrchestratorError("일반 파일과 심볼릭 링크만 검증할 수 있습니다.")
+        file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        with os.fdopen(file_fd, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise OrchestratorError("검증 중 파일 유형이 변경되었습니다.")
+            content = handle.read()
+            after = os.fstat(handle.fileno())
+        if (opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != (
+            after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            raise OrchestratorError("파일을 읽는 동안 내용이 변경되었습니다.")
+        return "100755" if opened.st_mode & 0o111 else "100644", content
+    except OSError as exc:
+        # Do not expose link targets or OS error details that may contain private paths.
+        raise OrchestratorError("검증 파일을 안전하게 읽을 수 없습니다. 링크 경로와 파일 변경을 확인하세요.") from exc
+    finally:
+        os.close(fd)
+
+
+def git_object_id(kind: str, content: bytes, object_format: str) -> str:
+    return hashlib.new(object_format, f"{kind} {len(content)}\0".encode() + content).hexdigest()
+
+
+def candidate_tree(entries: list[dict[str, str]], object_format: str) -> str:
+    """Compute Git's raw tree ID without staging, filters, hooks, or object writes."""
+    root: dict[str, Any] = {}
+    for entry in entries:
+        if entry["mode"] == "missing":
+            continue
+        parts = entry["path"].split("/")
+        if any(part in {"", ".", "..", ".git"} for part in parts):
+            raise OrchestratorError("검증 대상 tree 경로가 올바르지 않습니다.")
+        directory = root
+        for part in parts[:-1]:
+            directory = directory.setdefault(part, {})
+            if not isinstance(directory, dict):
+                raise OrchestratorError("파일과 디렉터리의 검증 경로가 충돌합니다.")
+        directory[parts[-1]] = (entry["mode"], entry["blob"])
+
+    def tree_id(directory: dict[str, Any]) -> str:
+        content = bytearray()
+        for name, value in sorted(directory.items(), key=lambda item: os.fsencode(item[0]) + (b"/" if isinstance(item[1], dict) else b"")):
+            mode, oid = ("40000", tree_id(value)) if isinstance(value, dict) else value
+            content.extend(mode.encode() + b" " + os.fsencode(name) + b"\0" + bytes.fromhex(oid))
+        return git_object_id("tree", bytes(content), object_format)
+
+    return tree_id(root)
+
+
+def validation_snapshot(state: dict[str, Any], cwd: Path) -> dict[str, Any]:
+    """Bind raw repository inputs and check argv to both a source and a commit tree."""
+    def git(*args: str) -> str:
+        return run_cmd(["git", *args], cwd=cwd, env=checks_env()).stdout
+
+    head = git("rev-parse", "HEAD").strip()
+    branch = git("branch", "--show-current").strip()
+    object_format = git("rev-parse", "--show-object-format").strip()
+    if object_format not in {"sha1", "sha256"}:
+        raise OrchestratorError("지원하지 않는 Git object 형식입니다.")
+    index = git("ls-files", "--stage", "-z")
+    index_entries = []
+    for record in filter(None, index.split("\0")):
+        metadata, path = record.split("\t", 1)
+        mode, oid, stage = metadata.split()
+        if stage != "0" or mode not in {"100644", "100755", "120000"}:
+            raise OrchestratorError("충돌 index 또는 submodule은 자동 검증하지 않습니다.")
+        index_entries.append({"path": path, "mode": mode, "blob": oid})
+    paths = sorted(set(filter(None, git("ls-files", "--cached", "--others", "--exclude-standard", "-z").split("\0"))))
+    entries = []
+    for relative in paths:
+        mode, content = read_repo_entry(cwd, relative)
+        entries.append({"path": relative, "mode": mode, "sha256": hashlib.sha256(content).hexdigest(),
+                        "blob": git_object_id("blob", content, object_format)})
+    checks = discover_checks(cwd)
+    tree = candidate_tree(entries, object_format)
+    # Missing tracked paths describe deletions but do not survive the commit. Normalize them
+    # out of the target while retaining index/HEAD separately in the pre-commit fingerprint.
+    target = digest_json({"files": [entry for entry in entries if entry["mode"] != "missing"],
+                          "checks": checks, "task": state.get("task"), "plan": state.get("plan")})
+    snapshot = {"head": head, "branch": branch, "index": digest_json(index), "target": target,
+                "tree": tree, "index_tree": candidate_tree(index_entries, object_format),
+                "object_format": object_format, "checks": checks}
+    snapshot["fingerprint"] = digest_json(snapshot)
+    # Detect persistent changes to HEAD/index while enumerating and reading files.
+    if head != git("rev-parse", "HEAD").strip() or index != git("ls-files", "--stage", "-z"):
+        raise OrchestratorError("지문 생성 중 HEAD 또는 index가 변경되었습니다.")
+    return snapshot
+
+
+def validation_stop(state: dict[str, Any], reason: str) -> None:
+    fail(state, f"검증 대상 확인 실패: {reason}", VALIDATION_RECOVERY)
+
+
+def validation_record(state: dict[str, Any]) -> dict[str, Any]:
+    record = state.get("validation")
+    if not isinstance(record, dict) or record.get("version") != VALIDATION_VERSION:
+        validation_stop(state, "검증 지문이 없거나 지원하지 않는 구형 상태입니다.")
+    subject = record.get("subject")
+    if not isinstance(subject, dict) or not isinstance(record.get("steps"), dict):
+        validation_stop(state, "검증 기록 형식이 올바르지 않습니다.")
+    if any(not isinstance(subject.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", subject[key])
+           for key in ("fingerprint", "target", "index")):
+        validation_stop(state, "검증 지문 형식이 올바르지 않습니다.")
+    expected = 40 if subject.get("object_format") == "sha1" else 64
+    if subject.get("object_format") not in {"sha1", "sha256"} or any(
+        not isinstance(subject.get(key), str) or not re.fullmatch(rf"[0-9a-f]{{{expected}}}", subject[key])
+        for key in ("head", "tree", "index_tree")
+    ) or not isinstance(subject.get("checks"), dict):
+        validation_stop(state, "검증 대상 Git 정보가 올바르지 않습니다.")
+    return record
+
+
+def require_validation(state: dict[str, Any], cwd: Path, *, establish: bool = False) -> dict[str, Any]:
+    evidence = set(state.get("completed_steps", [])) & set((*VALIDATION_STEPS, "commit_created", "branch_pushed", "draft_pr_created"))
+    if "validation" not in state and (not establish or evidence or state.get("checks") or state.get("review")
+                                     or state.get("report") or "commit" in state or "commit_progress" in state):
+        validation_stop(state, "기존 완료 기록에 검증 지문이 없습니다.")
+    if "validation" in state:
+        validation_record(state)
+    try:
+        current = validation_snapshot(state, cwd)
+    except (OrchestratorError, OSError, ValueError):
+        validation_stop(state, "파일 또는 Git 상태를 안전하게 확인할 수 없습니다.")
+    if "validation" not in state:
+        state["validation"] = {"version": VALIDATION_VERSION, "subject": current, "steps": {}}
+        save_state(state, "validation_started", "검증 대상 지문 저장")
+    record = validation_record(state)
+    subject = record["subject"]
+    progress = state.get("commit_progress")
+    if "commit_progress" in state or "commit_created" in state.get("completed_steps", []):
+        require_validation_steps(state, VALIDATION_STEPS)
+        # Staging and committing are expected HEAD/index transitions, but never target changes.
+        if current["target"] != subject["target"] or current["tree"] != subject["tree"] or current["branch"] != subject["branch"]:
+            validation_stop(state, "승인된 커밋 대상 내용이 변경되었습니다.")
+        if not isinstance(progress, dict) or progress.get("fingerprint") != subject["fingerprint"]:
+            validation_stop(state, "커밋 진행 기록과 검증 지문이 다릅니다.")
+        if progress.get("phase") not in {"staging", "staged", "prepared"} or (
+            progress.get("phase") == "prepared" and not progress.get("commit")
+        ) or (progress.get("commit") is not None and (
+            not isinstance(progress["commit"], str)
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", progress["commit"])
+        )):
+            validation_stop(state, "커밋 진행 기록 형식이 올바르지 않습니다.")
+        allowed_heads = {subject["head"]}
+        if progress.get("commit"):
+            allowed_heads.add(progress["commit"])
+        if current["head"] not in allowed_heads:
+            validation_stop(state, "승인된 커밋의 HEAD가 변경되었습니다.")
+        if current["index_tree"] != subject["tree"] and not (
+            progress.get("phase") == "staging" and current["fingerprint"] == subject["fingerprint"]
+        ):
+            validation_stop(state, "staging 결과가 검증된 tree와 다릅니다.")
+        if progress.get("commit"):
+            commit = progress["commit"]
+            details = run_cmd(["git", "show", "-s", "--format=%T %P", commit, "--"], cwd=cwd, env=checks_env()).stdout.strip()
+            if details != f"{subject['tree']} {subject['head']}":
+                validation_stop(state, "커밋 tree 또는 부모가 검증 대상과 다릅니다.")
+        if "commit_created" in state.get("completed_steps", []) and (
+            state.get("commit") != progress.get("commit") or current["head"] != state.get("commit")
+        ):
+            validation_stop(state, "완료된 커밋과 HEAD가 다릅니다.")
+    elif current != subject:
+        validation_stop(state, "저장된 검증 대상과 현재 내용이 다릅니다.")
+    for step in evidence & set(VALIDATION_STEPS):
+        if record["steps"].get(step) != subject["fingerprint"]:
+            validation_stop(state, f"{step} 결과가 같은 검증 대상에 연결되지 않았습니다.")
+    return subject
+
+
+def require_validation_steps(state: dict[str, Any], steps: Sequence[str]) -> None:
+    record = validation_record(state)
+    if any(step not in state.get("completed_steps", []) or record["steps"].get(step) != record["subject"]["fingerprint"] for step in steps):
+        validation_stop(state, "선행 단계의 검증 기록이 누락되었거나 서로 다릅니다.")
+
+
+def bind_validation_step(state: dict[str, Any], step: str) -> None:
+    record = validation_record(state)
+    record["steps"][step] = record["subject"]["fingerprint"]
+
+
+def invalidate_for_correction(state: dict[str, Any]) -> None:
+    """Archive the whole validation generation before a known, budgeted FIX mutation."""
+    if state.get("commit_progress") or state.get("commit") or state.get("pushed") or state.get("draft_pr"):
+        validation_stop(state, "커밋 또는 외부 진행 이후에는 자동 재검증하지 않습니다.")
+    keys = ("validation", "checks", "review", "reviewer_thread_id", "report", "review_status")
+    state.setdefault("validation_history", []).append({
+        "at": now(), "reason": "reviewer_FIX", "fix_attempts": state["fix_attempts"],
+        "completed_steps": list(state["completed_steps"]),
+        "records": {key: copy.deepcopy(state[key]) for key in keys if key in state},
+    })
+    for key in keys:
+        state.pop(key, None)
+    state["checks"] = {}
+    state["review_status"] = "fix_requested"
+    state["completed_steps"] = [step for step in state["completed_steps"] if step not in VALIDATION_STEPS]
+    save_state(state, "fix_requested", "FIX 재수정 전 검증·보고서·최종 승인 기록을 보존하고 무효화")
+
+
+def create_validated_commit(state: dict[str, Any], cwd: Path) -> None:
+    require_validation_steps(state, VALIDATION_STEPS)
+    subject = require_validation(state, cwd)
+    assert_feature_worktree(cwd)
+    branch = state.get("branch", "")
+    if (not state.get("worktree_owned") or not isinstance(branch, str)
+            or branch != subject["branch"] or not branch.startswith("agent/")
+            or not re.fullmatch(r"[A-Za-z0-9._/-]+", branch)):
+        validation_stop(state, "승인된 소유 feature branch가 아닙니다.")
+    env = checks_env()
+    if not state.get("commit_progress"):
+        if not git_status(cwd).strip():
+            fail(state, "커밋할 변경사항이 없어 push/PR을 중단했습니다.", "작업 결과와 Prime Agent 로그를 확인하세요.")
+        state["commit_progress"] = {"phase": "staging", "fingerprint": subject["fingerprint"]}
+        save_state(state, "commit_staging", "검증된 tree의 staging 시작")
+    progress = state["commit_progress"]
+    if progress["phase"] == "staging":
+        run_cmd(["git", "add", "--all"], cwd=cwd, env=env)
+        require_validation(state, cwd)
+        if run_cmd(["git", "write-tree"], cwd=cwd, env=env).stdout.strip() != subject["tree"]:
+            validation_stop(state, "staging 결과가 검증된 tree와 다릅니다.")
+        progress["phase"] = "staged"
+        save_state(state, "commit_staged", "검증된 tree와 index 일치 확인")
+    if not progress.get("commit"):
+        require_validation(state, cwd)
+        # commit-tree consumes an immutable tree, never the mutable index; it runs no commit hooks.
+        commit = run_cmd(["git", "commit-tree", subject["tree"], "-p", subject["head"], "-F", "-"],
+                         cwd=cwd, env=env, input_text=f"agent: {state['source']}\n").stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+            validation_stop(state, "커밋 생성 결과가 올바르지 않습니다.")
+        progress.update({"commit": commit, "phase": "prepared"})
+        save_state(state, "commit_prepared", "검증된 tree의 커밋 객체 저장; branch 갱신 대기")
+    require_validation(state, cwd)
+    head = run_cmd(["git", "rev-parse", "HEAD"], cwd=cwd, env=env).stdout.strip()
+    if head == subject["head"]:
+        run_cmd(["git", "update-ref", "--no-deref", f"refs/heads/{branch}", progress["commit"], subject["head"]], cwd=cwd, env=env)
+    elif head != progress["commit"]:
+        validation_stop(state, "커밋 적용 전에 HEAD가 변경되었습니다.")
+    state["commit"] = progress["commit"]
+    complete_step(state, "commit_created", "승인 후 검증된 tree의 로컬 feature commit 생성")
+
+
 def discover_checks(cwd: Path = ROOT) -> dict[str, list[str] | None]:
     config = load_config()
     found: dict[str, list[str] | None] = {}
     configured = config.get("checks", {})
-    package = cwd / "package.json"
-    scripts = load_json(package).get("scripts", {}) if package.exists() else {}
+    mode, content = read_repo_entry(cwd, "package.json")
+    if mode == "120000":
+        raise OrchestratorError("검사 설정 package.json의 심볼릭 링크를 따라 읽지 않습니다.")
+    scripts = json.loads(content).get("scripts", {}) if mode != "missing" else {}
     aliases = {"lint": ["lint"], "typecheck": ["typecheck", "type-check"], "test": ["test"], "build": ["build"]}
     for name, candidates in aliases.items():
         explicit = configured.get(name)
@@ -874,22 +1158,35 @@ def discover_checks(cwd: Path = ROOT) -> dict[str, list[str] | None]:
 
 
 def run_checks(state: dict[str, Any], cwd: Path, label: str) -> bool:
+    subject = require_validation(state, cwd, establish=True)
     results: dict[str, Any] = {}
     all_ok = True
-    for name, command in discover_checks(cwd).items():
+    for name, command in subject["checks"].items():
+        require_validation(state, cwd)
         if not command:
             results[name] = {"status": "SKIPPED", "reason": "repository command not configured"}
             continue
-        result = run_cmd(command, cwd=cwd, check=False, timeout=600)
+        result = run_cmd(command, cwd=cwd, env=checks_env(), check=False, timeout=600)
         results[name] = {
             "status": "PASS" if result.returncode == 0 else "FAIL", "command": command,
             "returncode": result.returncode, "stdout_tail": redact_secrets(result.stdout[-4000:]),
             "stderr_tail": redact_secrets(result.stderr[-4000:]),
         }
+        require_validation(state, cwd)
         all_ok = all_ok and result.returncode == 0
+    require_validation(state, cwd)
     state.setdefault("checks", {})[label] = results
+    if all_ok:
+        bind_validation_step(state, f"checks_{label}")
     save_state(state, f"checks_{label}", f"검사 세트 {label} 완료")
     return all_ok
+
+
+def checks_env() -> dict[str, str]:
+    """Make a child-only copy; never remove credentials from the orchestrator parent."""
+    return {name: value for name, value in os.environ.items()
+            if name.upper() not in SENSITIVE_ENV_NAMES
+            and not name.upper().startswith(("GITHUB_", "GH_", "CLOUDFLARE_", "CF_"))}
 
 
 def prime_env() -> dict[str, str]:
@@ -955,32 +1252,39 @@ def run_prime(state: dict[str, Any], correction: str | None = None) -> None:
 
 def review_snapshot(worktree: Path) -> str:
     status = run_cmd(["git", "status", "--short"], cwd=worktree).stdout
-    diff = run_cmd(["git", "diff", "--no-ext-diff"], cwd=worktree).stdout
-    untracked = run_cmd(["git", "ls-files", "--others", "--exclude-standard"], cwd=worktree).stdout.splitlines()
+    diff = run_cmd(["git", "diff", "--no-ext-diff", "--no-textconv"], cwd=worktree).stdout
+    staged = run_cmd(["git", "diff", "--cached", "--no-ext-diff", "--no-textconv", "HEAD"], cwd=worktree).stdout
+    untracked = run_cmd(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=worktree).stdout.split("\0")
     additions: list[str] = []
-    for relative in untracked:
-        path = worktree / relative
-        if not path.is_file():
+    for relative in filter(None, untracked):
+        mode, raw = read_repo_entry(worktree, relative)
+        if mode == "missing":
             continue
-        if path.stat().st_size > 200_000:
+        if mode == "120000":
+            additions.append(f"UNTRACKED SYMLINK: {relative}\nLINK TEXT: {os.fsdecode(raw)!r}")
+            continue
+        if len(raw) > 200_000:
             additions.append(f"UNTRACKED {relative}: omitted because file is larger than 200 KB")
             continue
         try:
-            content = path.read_text(encoding="utf-8")
+            content = raw.decode("utf-8")
         except UnicodeDecodeError:
             additions.append(f"UNTRACKED {relative}: binary content omitted")
         else:
             additions.append(f"UNTRACKED FILE: {relative}\n{content}")
-    return f"GIT STATUS:\n{status}\n\nTRACKED DIFF:\n{diff}\n\n" + "\n\n".join(additions)
+    return f"GIT STATUS:\n{status}\n\nSTAGED DIFF:\n{staged}\n\nUNSTAGED DIFF:\n{diff}\n\n" + "\n\n".join(additions)
 
 
 def final_report(state: dict[str, Any]) -> None:
     worktree = Path(state["worktree"])
+    require_validation_steps(state, VALIDATION_STEPS[:3])
+    subject = require_validation(state, worktree)
     changed = run_cmd(["git", "status", "--short"], cwd=worktree).stdout.strip() or "(없음)"
     diffstat = run_cmd(["git", "diff", "--stat"], cwd=worktree).stdout.strip() or "(없음)"
     report = (
         f"# Agent Orchestrator Report\n\nRun: `{state['run_id']}`\n\n"
         f"Status: `{state['status']}`\n\nBranch: `{state.get('branch', '-')}`\n\n"
+        f"Validation fingerprint: `{subject['fingerprint']}`\n\nCandidate tree: `{subject['tree']}`\n\n"
         f"## Execution profile\n\n```json\n{json.dumps(state.get('execution_profile', {}), ensure_ascii=False, indent=2)}\n```\n\n"
         f"## Changed files\n\n```text\n{changed}\n```\n\n"
         f"## Diff summary\n\n```text\n{diffstat}\n```\n\n"
@@ -996,35 +1300,17 @@ def final_report(state: dict[str, Any]) -> None:
     REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
     REPORT_FILE.write_text(report, encoding="utf-8")
     state["report"] = str(REPORT_FILE)
+    require_validation(state, worktree)
+    bind_validation_step(state, "report_written")
     complete_step(state, "report_written", f"최종 보고서 작성: {REPORT_FILE}")
 
 
-def invalidate_stale_fix_review(state: dict[str, Any]) -> None:
-    """Migrate a pre-review-status FIX resume to a fresh review and downstream output."""
-    if "review_status" in state or "reviewed" not in state["completed_steps"]:
-        return
-    verdict = re.search(r"VERDICT:\s*(PASS|FIX|STOP)", state.get("review", ""), re.I)
-    if not verdict or verdict.group(1).upper() != "FIX":
-        return
-    externally_advanced = bool(
-        {"external_approval", "commit_created", "branch_pushed", "draft_pr_created"}
-        & set(state["completed_steps"])
-        or state.get("commit")
-        or state.get("pushed")
-        or state.get("draft_pr")
-    )
-    if externally_advanced:
-        fail(
-            state,
-            "외부 승인 또는 commit/push/Draft PR 이후 stale FIX 검토를 발견해 안전하게 중단했습니다.",
-            "외부 상태와 변경사항을 사람이 확인한 뒤 새 실행 여부를 결정하세요.",
-        )
-    invalidated = {"reviewed", "checks_final", "report_written"}
-    state["completed_steps"] = [step for step in state["completed_steps"] if step not in invalidated]
-    state.get("checks", {}).pop("final", None)
-    state.pop("report", None)
-    state["review_status"] = "pending"
-    save_state(state, "stale_review_invalidated", "stale FIX 검토와 최종 검사/보고서를 무효화")
+def guard_validation_resume(state: dict[str, Any]) -> None:
+    """Reject stale/legacy evidence before CLI preflight, model calls, or approvals."""
+    evidence = set(state.get("completed_steps", [])) & set((*VALIDATION_STEPS, "commit_created", "branch_pushed", "draft_pr_created"))
+    if ("validation" in state or "commit_progress" in state or "commit" in state or evidence
+            or any(state.get(key) for key in ("checks", "review", "report"))):
+        require_validation(state, Path(state.get("worktree", "")))
 
 
 def continue_run(state: dict[str, Any]) -> int:
@@ -1033,7 +1319,7 @@ def continue_run(state: dict[str, Any]) -> int:
         state["status"] = "complete"
         save_state(state, "complete", "dry-run 정상 종료")
         return 0
-    invalidate_stale_fix_review(state)
+    guard_validation_resume(state)
     if "planned" not in state["completed_steps"]:
         thread_id, plan = codex_turn("planner", state["task"], ROOT)
         state["planner_thread_id"] = thread_id
@@ -1163,10 +1449,6 @@ def continue_run(state: dict[str, Any]) -> int:
     if "prime_implemented" not in state["completed_steps"]:
         run_prime(state)
     worktree = Path(state["worktree"])
-    if "checks_initial" not in state["completed_steps"]:
-        if not run_checks(state, worktree, "initial"):
-            fail(state, "초기 프로젝트 검사가 실패했습니다.", "검사 로그를 확인하고 resume 하세요.")
-        complete_step(state, "checks_initial", "저장소에 실제 존재하는 초기 검사 완료")
     # A correction can be interrupted after its attempt was persisted.  Such a
     # resumed run must obtain a new review, not reuse the stale FIX verdict.
     if "review_status" not in state:
@@ -1176,13 +1458,25 @@ def continue_run(state: dict[str, Any]) -> int:
         state["completed_steps"] = [step for step in state["completed_steps"] if step != "reviewed"]
         state["review_status"] = "pending"
     while True:
+        require_validation(state, worktree, establish=True)
+        if "checks_initial" not in state["completed_steps"]:
+            if not run_checks(state, worktree, "initial"):
+                fail(state, "초기 프로젝트 검사가 실패했습니다.", "검사 로그를 확인하고 resume 하세요.")
+            require_validation(state, worktree)
+            complete_step(state, "checks_initial", "저장소에 실제 존재하는 초기 검사 완료")
+        require_validation_steps(state, ("checks_initial",))
+        require_validation(state, worktree)
         if "reviewed" not in state["completed_steps"]:
             snapshot = review_snapshot(worktree)
+            require_validation(state, worktree)
             review_task = f"TASK:\n{state['task']}\n\nAPPROVED PLAN:\n{state['plan']}\n\nCHANGES:\n{snapshot}"
             thread_id, review = codex_turn("reviewer", review_task, worktree)
+            require_validation(state, worktree)
             state["reviewer_thread_id"] = thread_id
             state["review"] = review
+            bind_validation_step(state, "reviewed")
             complete_step(state, "reviewed", "별도 Codex reviewer thread가 읽기 전용 검수 완료")
+        require_validation_steps(state, ("checks_initial", "reviewed"))
         verdict = re.search(r"VERDICT:\s*(PASS|FIX|STOP)", state["review"], re.I)
         verdict_text = verdict.group(1).upper() if verdict else "STOP"
         if verdict_text == "STOP":
@@ -1194,32 +1488,36 @@ def continue_run(state: dict[str, Any]) -> int:
         if state["fix_attempts"] >= state["execution_profile"]["max_fix_attempts"]:
             fail(state, "Prime Agent 재수정 한도를 초과했습니다.", "남은 문제를 사람이 수정하세요.")
         state["fix_attempts"] += 1
-        state["review_status"] = "fix_requested"
-        save_state(state, "fix_requested", f"Prime Agent 재수정 {state['fix_attempts']}회 요청")
-        run_prime(state, f"다음 독립 검수 지적만 수정하세요. 외부 작업은 금지됩니다.\n\n{state['review']}")
-        state["completed_steps"].remove("reviewed")
+        correction = f"다음 독립 검수 지적만 수정하세요. 외부 작업은 금지됩니다.\n\n{state['review']}"
+        invalidate_for_correction(state)
+        run_prime(state, correction)
         state["review_status"] = "pending"
         save_state(state, "review_requested", "수정 후 독립 재검수 요청")
+    require_validation(state, worktree)
     if "checks_final" not in state["completed_steps"]:
         if not run_checks(state, worktree, "final"):
             fail(state, "최종 프로젝트 검사가 실패했습니다.", "검사 로그와 변경사항을 확인하세요.")
         complete_step(state, "checks_final", "최종 검사 완료")
+    require_validation_steps(state, VALIDATION_STEPS[:3])
+    require_validation(state, worktree)
     if "report_written" not in state["completed_steps"]:
         final_report(state)
+    require_validation_steps(state, VALIDATION_STEPS[:4])
+    require_validation(state, worktree)
     if "external_approval" not in state["completed_steps"]:
-        if not approval("feature branch push와 Draft PR 생성을 승인할까요?"):
+        approved = approval("feature branch push와 Draft PR 생성을 승인할까요?")
+        require_validation(state, worktree)
+        if not approved:
             state["status"] = "awaiting_external_approval"
             save_state(state, "awaiting_external_approval", "push/Draft PR 승인 대기")
             print("push와 PR을 실행하지 않았습니다. 필요할 때 `resume`을 실행하세요.")
             return 2
+        bind_validation_step(state, "external_approval")
         complete_step(state, "external_approval", "사용자가 feature push 및 Draft PR 승인")
+    require_validation_steps(state, VALIDATION_STEPS)
+    require_validation(state, worktree)
     if "commit_created" not in state["completed_steps"]:
-        if not git_status(worktree).strip():
-            fail(state, "커밋할 변경사항이 없어 push/PR을 중단했습니다.", "작업 결과와 Prime Agent 로그를 확인하세요.")
-        run_cmd(["git", "add", "--all"], cwd=worktree)
-        run_cmd(["git", "commit", "-m", f"agent: {state['source']}"], cwd=worktree)
-        state["commit"] = run_cmd(["git", "rev-parse", "HEAD"], cwd=worktree).stdout.strip()
-        complete_step(state, "commit_created", "승인 후 로컬 feature commit 생성")
+        create_validated_commit(state, worktree)
     if not state.get("pushed"):
         state["pushed"] = False
         save_state(state, "push_pending", "승인된 feature branch push 시작")
